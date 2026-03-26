@@ -10,6 +10,7 @@ from dataclasses import dataclass, asdict
 
 import torch
 import torch.nn.functional as F
+from torch.nested import nested_tensor
 from torch.distributions import Normal, Beta, kl
 from torch.nn import Module, ModuleList, Embedding, Parameter, Sequential, Linear, RMSNorm, Identity
 from torch import nn, cat, stack, arange, tensor, Tensor, is_tensor, full, zeros, ones, randint, rand, randn, randn_like, empty, full, linspace, arange
@@ -32,6 +33,8 @@ from assoc_scan import AssocScan
 from PoPE_pytorch import PoPE, flash_attn_with_pope
 
 from discrete_continuous_embed_readout import MultiCategorical
+
+from hyper_connections import mc_get_init_and_expand_reduce_stream_functions
 
 import einx
 from torch_einops_utils import (
@@ -136,7 +139,7 @@ class Experience:
         return Experience(**experience_dict)
 
 def combine_experiences(
-    exps: list[Experiences]
+    exps: list[Experience]
 ) -> Experience:
 
     assert len(exps) > 0
