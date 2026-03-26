@@ -96,6 +96,45 @@ actor_loss, critic_loss = world_model.learn_from_experience(experience)
 (actor_loss + critic_loss).backward()
 ```
 
+## Minecraft Quick Start Summary
+
+```bash
+# 1. Install dependencies
+pip install torch torchvision einops accelerate adam-atan2-pytorch \
+    x-mlps-pytorch hyper-connections vit-pytorch assoc-scan \
+    discrete-continuous-embed-readout torch-einops-utils ema-pytorch \
+    einx opencv-python
+
+# 2. Download VPT data (assumes you have .mp4/.jsonl pairs)
+# Place them in a directory, e.g., ./data/vpt-recordings/
+
+# 3. Phase 1: Train tokenizer (compresses video to latents)
+python train_dreamer4_minecraft.py --phase 1 \
+    --data_dir ./data/vpt-recordings \
+    --output_dir ./checkpoints \
+    --num_steps 50000
+
+# 4. Phase 2: Train world model (learns dynamics from latents + actions)
+python train_dreamer4_minecraft.py --phase 2 \
+    --data_dir ./data/vpt-recordings \
+    --output_dir ./checkpoints \
+    --tokenizer_ckpt ./checkpoints/tokenizer.pt \
+    --num_steps 100000
+
+# 5. Phase 3: Train agent in dreams (no real environment needed)
+python train_dreamer4_minecraft.py --phase 3 \
+    --output_dir ./checkpoints \
+    --dynamics_ckpt ./checkpoints/dynamics.pt \
+    --num_steps 50000
+
+# 6. Evaluate in MineRL
+python evaluate_dreamer4_minecraft.py \
+    --checkpoint ./checkpoints/dreamer4_minecraft.pt \
+    --n_episodes 100 \
+    --n_workers 8
+```
+
+
 ## Moving MNIST
 
 To train a simple tokenizer on Moving MNIST for 5000 steps and then use it to generate action-conditioned dynamics models (should not take more than an hour):
