@@ -119,10 +119,16 @@ def run_worker(
         from minerl.herobraine.env_specs.human_survival_specs import HumanSurvival
         from agent import ENV_KWARGS
         from dreamer4_minecraft_agent import Dreamer4MinecraftAgent
-        from minerl.env.malmo import InstanceManager
-        
-        # prevent port collisions
+        from minerl.env.malmo import InstanceManager, MinecraftInstance
+
         InstanceManager.configure_malmo_base_port(9000 + worker_id * 100)
+
+        # Reduce JVM heap from 4G to 2G per instance to prevent OOM kills
+        _orig_mc_init = MinecraftInstance.__init__
+        def _mc_init_with_reduced_mem(self, port=None, existing=False, status_dir=None,
+                                    seed=None, instance_id=None, max_mem=args_dict["minecraft_mem"]):
+            _orig_mc_init(self, port, existing, status_dir, seed, instance_id, max_mem)
+        MinecraftInstance.__init__ = _mc_init_with_reduced_mem
 
 
         env = HumanSurvival(**ENV_KWARGS).make()
@@ -150,7 +156,12 @@ def run_worker(
                 except Exception as e:
                     print(f"[Worker {worker_id}] env.reset() attempt {attempt+1}/5 failed: {e}")
                     if attempt < 4:
+                        try:
+                            env.close() # have to make new or will just keep getting error
+                        except Exception:
+                            pass
                         time.sleep(10 * (attempt + 1))
+                        env = HumanSurvival(**ENV_KWARGS).make()
                     else:
                         raise
 
@@ -166,6 +177,11 @@ def run_worker(
                     obs, reward, done, info = env.step(action)
                 except Exception as e:
                     print(f"[Worker {worker_id}] Error at step {step}: {e}")
+                    break
+
+                # Detect MineRL returning a random obs due to a dead Minecraft process
+                if 'error' in info:
+                    print(f"[Worker {worker_id}] Minecraft connection lost at step {step}, ending episode")
                     break
 
                 total_reward += reward
@@ -251,7 +267,9 @@ def main():
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to dreamer4_minecraft.pt")
     parser.add_argument("--n_episodes", type=int, default=100)
-    parser.add_argument("--n_workers", type=int, default=8)
+    parser.add_argument("--n_workers", type=int, default=1)
+    parser.add_argument("--minecraft_mem", type=str, default="4G",
+                        help="Max JVM heap per Minecraft instance (e.g., '2G', '1G'). Enables parallelism with low VRAM.")
     parser.add_argument("--max_steps", type=int, default=36000,
                         help="Max steps per episode (36000 = 30min at 20fps)")
     parser.add_argument("--deterministic", action="store_true")
@@ -277,6 +295,7 @@ def main():
     args_dict = {
         "checkpoint": os.path.abspath(args.checkpoint),
         "max_steps": args.max_steps,
+        "minecraft_mem": args.minecraft_mem,
         "deterministic": args.deterministic,
         "headless": not args.no_headless,
     }
@@ -286,9 +305,8 @@ def main():
         p = ctx.Process(target=run_worker, args=(w, episode_queue, result_queue, args_dict))
         p.start()
         workers.append(p)
-    if w < args.n_workers - 1:
-        # FIXME this is terrible but it works I guess?
-        time.sleep(10)  # Stagger Minecraft JVM launches to avoid resource contention
+        if w < args.n_workers - 1:
+            time.sleep(10)  # Stagger Minecraft JVM launches to avoid resource contention
 
     print(f"Started {args.n_workers} workers for {args.n_episodes} episodes")
 

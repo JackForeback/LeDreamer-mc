@@ -357,10 +357,21 @@ if __name__ == "__main__":
 
         if step % 100 == 0:
             print(f"Step {step}, reward: {total_reward:.2f}")
+        # if args.render:
+        #     env.render()
+        # try new version, original was laggy
+        # FIXME Interpolation wont be needed when training at full resolution
         if args.render:
-            env.render()
+            frame = obs["pov"]
+            frame_bgr = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_LINEAR)
+            cv2.imshow("Dreamer4 Minecraft", frame_bgr[:, :, ::-1])
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
         if done:
             print(f"Episode done at step {step}, reward: {total_reward:.2f}")
             obs = env.reset()
             agent.reset()
             total_reward = 0.0
+    # shut down at end of for loop
+    if args.render:
+        cv2.destroyAllWindows()
