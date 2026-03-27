@@ -119,6 +119,11 @@ def run_worker(
         from minerl.herobraine.env_specs.human_survival_specs import HumanSurvival
         from agent import ENV_KWARGS
         from dreamer4_minecraft_agent import Dreamer4MinecraftAgent
+        from minerl.env.malmo import InstanceManager
+        
+        # prevent port collisions
+        InstanceManager.configure_malmo_base_port(9000 + worker_id * 100)
+
 
         env = HumanSurvival(**ENV_KWARGS).make()
 
@@ -136,7 +141,19 @@ def run_worker(
             print(f"[Worker {worker_id}] Starting episode {episode_id}")
             t0 = time.time()
 
-            obs = env.reset()
+            # MineRL can transiently fail, so give it a few tries with backoff
+            obs = None
+            for attempt in range(5):
+                try:
+                    obs = env.reset()
+                    break
+                except Exception as e:
+                    print(f"[Worker {worker_id}] env.reset() attempt {attempt+1}/5 failed: {e}")
+                    if attempt < 4:
+                        time.sleep(10 * (attempt + 1))
+                    else:
+                        raise
+
             agent.reset()
 
             total_reward = 0.0
@@ -269,6 +286,9 @@ def main():
         p = ctx.Process(target=run_worker, args=(w, episode_queue, result_queue, args_dict))
         p.start()
         workers.append(p)
+    if w < args.n_workers - 1:
+        # FIXME this is terrible but it works I guess?
+        time.sleep(10)  # Stagger Minecraft JVM launches to avoid resource contention
 
     print(f"Started {args.n_workers} workers for {args.n_episodes} episodes")
 

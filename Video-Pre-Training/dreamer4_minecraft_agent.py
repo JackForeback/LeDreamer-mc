@@ -292,7 +292,7 @@ class Dreamer4MinecraftAgent:
         assert agent_embed.ndim == 4, \
             f"Expected 4D agent_embed, got shape {agent_embed.shape}"
         # Take last timestep, first agent
-        one_agent_embed = agent_embed[:, -1:, 0:1, :]  # (1, 1, 1, dim)
+        one_agent_embed = agent_embed[:, -1:, 0, :]  # (1, 1, dim)
 
         # Policy head → action distribution
         policy_embed = self.dynamics.policy_head(one_agent_embed)
