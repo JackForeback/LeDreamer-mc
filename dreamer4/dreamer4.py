@@ -559,23 +559,27 @@ class LatentAutoregressiveLoss(Module):
     def forward(
         self,
         x,
+        target = None,
         return_loss = True,
         mask = None,
         cond = None,
         return_unreduced_loss = False
     ):
+        is_same_layer = not exists(target) or x is target
+        target = default(target, x)
+
         pred_input = x[:, :-1]
-        target = x[:, 1:]
+        target_output = target[:, 1:]
 
         if exists(cond):
-            pred_input = torch.cat((pred_input, cond[:, :-1]), dim = -1)
+            pred_input = cat((pred_input, cond[:, :-1]), dim = -1)
 
         pred = self.net(pred_input)
 
         if not return_loss:
             return pred
 
-        loss = F.mse_loss(pred, target, reduction = 'none')
+        loss = F.mse_loss(pred, target_output, reduction = 'none')
 
         if return_unreduced_loss:
             return loss, pred
@@ -585,7 +589,14 @@ class LatentAutoregressiveLoss(Module):
 
         loss = masked_mean(loss, mask)
 
-        sigreg = self.sigreg_loss(target, mask = mask, **self.sigreg_loss_kwargs)
+        if is_same_layer:
+            sigreg_input = target_output
+            sigreg_mask = mask
+        else:
+            sigreg_input = cat((x[:, :-1], target_output), dim = 0)
+            sigreg_mask = cat((mask, mask), dim = 0) if exists(mask) else None
+
+        sigreg = self.sigreg_loss(sigreg_input, mask = sigreg_mask, **self.sigreg_loss_kwargs)
         return loss, sigreg, pred
 
 def ramp_weight(times, slope = 0.9, intercept = 0.1):
@@ -2618,13 +2629,14 @@ class DynamicsWorldModel(Module):
         pmpo_reverse_kl = True,
         pmpo_kl_div_loss_weight = .3,
         use_delight_gating = True,
+        delight_temperature = 1.,
         normalize_advantages = None,
         value_clip = 0.4,
         policy_entropy_weight = .01,
         gae_use_accelerated = False,
         use_loss_normalization = False,
         time_attention_use_pope = False,
-        latent_ar_layer: int | None = None,
+        latent_ar_layer: int | tuple[int, int] | None = None,
         latent_ar = False,
         latent_ar_action_conditioned = False,
         latent_ar_loss_weight = 0.,
@@ -2913,6 +2925,7 @@ class DynamicsWorldModel(Module):
         # delight related
 
         self.use_delight_gating = use_delight_gating
+        self.delight_temperature = delight_temperature
 
         # rewards related
 
@@ -3287,10 +3300,12 @@ class DynamicsWorldModel(Module):
         only_learn_policy_value_heads = True, # in the paper, they do not finetune the entire dynamics model, they just learn the heads
         use_pmpo = True,
         use_delight_gating = None,
+        delight_temperature = None,
         normalize_advantages = None,
         eps = 1e-6
     ):
         use_delight_gating = default(use_delight_gating, self.use_delight_gating)
+        delight_temperature = default(delight_temperature, self.delight_temperature)
 
         assert isinstance(experience, Experience)
 
@@ -3438,7 +3453,7 @@ class DynamicsWorldModel(Module):
         # Ian Osband - https://arxiv.org/abs/2603.14608v1
 
         if use_delight_gating:
-            delight_gate = (-log_probs * advantage).sigmoid().detach()
+            delight_gate = ((-log_probs * advantage) / delight_temperature).sigmoid().detach()
 
         # maybe pmpo
         # pmpo - weighting the positive and negative advantages equally - ignoring magnitude of advantage and taking the sign
@@ -3508,17 +3523,16 @@ class DynamicsWorldModel(Module):
 
         else:
 
-            maybe_weighted_advantage = advantage
-
-            if use_delight_gating:
-                maybe_weighted_advantage = advantage * delight_gate
-
             # ppo clipped surrogate loss
 
             ratio = (log_probs - old_log_probs).exp()
             clipped_ratio = ratio.clamp(1. - self.ppo_eps_clip, 1. + self.ppo_eps_clip)
 
-            policy_loss = -torch.min(ratio * maybe_weighted_advantage, clipped_ratio * maybe_weighted_advantage)
+            policy_loss = -torch.min(ratio * advantage, clipped_ratio * advantage)
+
+            if use_delight_gating:
+                policy_loss = policy_loss * delight_gate
+
             policy_loss = reduce(policy_loss, 'b t na -> b t', 'sum')
 
             policy_loss = masked_mean(policy_loss, mask)
@@ -4724,9 +4738,17 @@ class DynamicsWorldModel(Module):
 
         if self.has_latent_ar:
             layer_hiddens = intermediates.layer_hiddens
-            hiddens = layer_hiddens[self.latent_ar_layer]
 
-            _, space_hiddens, *_ = unpack(hiddens, packed_tokens_shape, 'b t * d')
+            if isinstance(self.latent_ar_layer, tuple):
+                source_layer, target_layer = self.latent_ar_layer
+            else:
+                source_layer = target_layer = self.latent_ar_layer
+
+            source_hiddens = layer_hiddens[source_layer]
+            target_hiddens = layer_hiddens[target_layer]
+
+            _, space_source_hiddens, *_ = unpack(source_hiddens, packed_tokens_shape, 'b t * d')
+            _, space_target_hiddens, *_ = unpack(target_hiddens, packed_tokens_shape, 'b t * d')
 
             cond_action = None
 
@@ -4734,9 +4756,9 @@ class DynamicsWorldModel(Module):
                 if not exists(latent_ar_action_embed):
                     latent_ar_action_embed = torch.zeros((*latents.shape[:2], self.action_embedder.dim), device = self.device, dtype = torch.float32)
 
-                cond_action = repeat(latent_ar_action_embed, 'b t d -> b t n d', n = space_hiddens.shape[2])
+                cond_action = repeat(latent_ar_action_embed, 'b t d -> b t n d', n = space_source_hiddens.shape[2])
 
-            latent_ar_loss, latent_ar_sigreg_loss, _ = self.latent_ar(space_hiddens, mask = loss_mask, cond = cond_action)
+            latent_ar_loss, latent_ar_sigreg_loss, _ = self.latent_ar(space_source_hiddens, target = space_target_hiddens, mask = loss_mask, cond = cond_action)
 
         # gather losses - they sum across the multi token prediction steps for rewards and actions - eq (9)
 
