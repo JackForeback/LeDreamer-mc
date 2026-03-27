@@ -4,6 +4,7 @@ accelerated-scan==0.3.1
 adam-atan2-pytorch==0.2.8
 annotated-doc==0.0.4
 anyio==4.13.0
+aria2==0.0.1b0
 assoc-scan==0.0.4
 beartype==0.22.9
 certifi==2026.2.25

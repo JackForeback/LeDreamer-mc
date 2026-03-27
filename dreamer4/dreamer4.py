@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Callable
+from typing import Callable, Optional
 
 from math import ceil, log2
 from random import random
@@ -22,7 +22,6 @@ from torchvision.models import VGG16_Weights
 from torch.optim import Optimizer
 from adam_atan2_pytorch import MuonAdamAtan2
 
-from x_mlps_pytorch import MLP
 from x_mlps_pytorch.ensemble import Ensemble
 from x_mlps_pytorch.normed_mlp import create_mlp
 
@@ -86,7 +85,7 @@ try:
     from torch.nn.attention.flex_attention import flex_attention, create_block_mask
     if torch.cuda.is_available():
         import torch._dynamo
-        torch._dynamo.config.cache_size_limit = 256
+        torch._dynamo.config.cache_size_limit = 256 # tried to cache things for speed?
         flex_attention = torch.compile(flex_attention)
 except ImportError:
     pass
@@ -97,9 +96,9 @@ LinearNoBias = partial(Linear, bias = False)
 
 VideoTokenizerIntermediates = namedtuple('VideoTokenizerIntermediates', ('losses', 'recon'))
 
-TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ar', 'latent_ar_sigreg'))
+TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ar'))
 
-WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred', 'latent_ar', 'latent_ar_sigreg'))
+WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred'))
 
 AttentionIntermediates = namedtuple('AttentionIntermediates', ('next_kv_cache', 'normed_inputs'))
 
@@ -111,7 +110,8 @@ Embeds = namedtuple('Embeds', ['agent', 'state_pred'])
 
 Actions = namedtuple('Actions', ['discrete', 'continuous'])
 
-MaybeTensor = Tensor | None
+MaybeTensor = Optional[Tensor]
+
 
 @dataclass
 class Experience:

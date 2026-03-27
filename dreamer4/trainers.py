@@ -406,7 +406,7 @@ class BehaviorCloneTrainer(Module):
         use_tensorboard_logger = False,
         log_dir: str | None = None,
         project_name = 'dreamer4',
-        log_video = True,
+        log_video = False,
         log_video_every = 100,
         checkpoint_every = 5000,
         checkpoint_folder = './checkpoints',
