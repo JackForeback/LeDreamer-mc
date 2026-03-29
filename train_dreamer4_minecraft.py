@@ -105,6 +105,16 @@ DYNAMICS_DEFAULTS = dict(
     policy_entropy_weight=0.01,
 )
 
+# LeWM dynamics: replaces flow matching with JEPA-style next-embedding prediction
+LEWM_DYNAMICS_DEFAULTS = dict(
+    **DYNAMICS_DEFAULTS,
+    use_lewm_dynamics=True,         # Enable LeWM mode
+    lewm_loss_weight=1.0,           # Next-embedding prediction loss weight
+    lewm_sigreg_loss_weight=0.05,   # SIGReg regularization weight
+    lewm_layer=-1,                  # Use last transformer layer for prediction
+    lewm_action_conditioned=True,   # Condition predictions on actions
+)
+
 TRAINING_DEFAULTS = dict(
     # Phase 1
     tokenizer_batch_size=2,             # Keep small — AttentionResidual layers are memory-intensive
@@ -268,15 +278,17 @@ def train_dynamics(args):
         )
 
     # Create dynamics model with the tokenizer
-    dynamics_config = DYNAMICS_DEFAULTS.copy()
+    base_defaults = LEWM_DYNAMICS_DEFAULTS if args.use_lewm else DYNAMICS_DEFAULTS
+    dynamics_config = base_defaults.copy()
     dynamics_config['num_latent_tokens'] = tok_config.get('num_latent_tokens', 16)
     dynamics_config['dim_latent'] = tok_config.get('dim_latent', 32)
 
+    variant = "LeWM" if args.use_lewm else "Dreamer4"
     dynamics = DynamicsWorldModel(
         video_tokenizer=tokenizer,
         **dynamics_config,
     )
-    print(f"DynamicsWorldModel parameters: {sum(p.numel() for p in dynamics.parameters()):,}")
+    print(f"DynamicsWorldModel ({variant}) parameters: {sum(p.numel() for p in dynamics.parameters()):,}")
 
     # Train using BehaviorCloneTrainer
     # The trainer accepts dict batches and calls dynamics(**batch_data)
@@ -296,11 +308,13 @@ def train_dynamics(args):
 
     # Save checkpoint
     os.makedirs(args.output_dir, exist_ok=True)
-    ckpt_path = os.path.join(args.output_dir, "dynamics.pt")
+    ckpt_name = "lewm_dynamics.pt" if args.use_lewm else "dynamics.pt"
+    ckpt_path = os.path.join(args.output_dir, ckpt_name)
     torch.save({
         'model': dynamics.state_dict(),
         'config': dynamics_config,
         'tokenizer_config': tok_config,
+        'use_lewm': args.use_lewm,
     }, ckpt_path)
     print(f"Dynamics model saved to {ckpt_path}")
 
@@ -336,8 +350,12 @@ def train_agent(args):
     # Load dynamics model from Phase 2
     assert args.dynamics_ckpt is not None, "Must provide --dynamics_ckpt for Phase 3"
     dyn_ckpt = torch.load(args.dynamics_ckpt, map_location='cpu', weights_only=False)
-    dyn_config = dyn_ckpt.get('config', DYNAMICS_DEFAULTS)
+    is_lewm = dyn_ckpt.get('use_lewm', False) or args.use_lewm
+    default_config = LEWM_DYNAMICS_DEFAULTS if is_lewm else DYNAMICS_DEFAULTS
+    dyn_config = dyn_ckpt.get('config', default_config)
     tok_config = dyn_ckpt.get('tokenizer_config', TOKENIZER_DEFAULTS)
+    if is_lewm:
+        print("Detected LeWM dynamics checkpoint")
 
     # Rebuild tokenizer (frozen)
     tokenizer = VideoTokenizer(**tok_config)
@@ -378,11 +396,13 @@ def train_agent(args):
 
     # Save final checkpoint with everything
     os.makedirs(args.output_dir, exist_ok=True)
-    ckpt_path = os.path.join(args.output_dir, "dreamer4_minecraft.pt")
+    ckpt_name = "lewm_minecraft.pt" if is_lewm else "dreamer4_minecraft.pt"
+    ckpt_path = os.path.join(args.output_dir, ckpt_name)
     torch.save({
         'model': dynamics.state_dict(),
         'config': dyn_config,
         'tokenizer_config': tok_config,
+        'use_lewm': is_lewm,
     }, ckpt_path)
     print(f"Trained agent saved to {ckpt_path}")
 
@@ -451,6 +471,11 @@ def main():
                         default=TRAINING_DEFAULTS['dream_num_steps'])
     parser.add_argument("--dream_generate_timesteps", type=int,
                         default=TRAINING_DEFAULTS['dream_generate_timesteps'])
+
+    # Model variant
+    parser.add_argument("--use_lewm", action="store_true",
+                        help="Use LeWM dynamics (JEPA-style next-embedding prediction) "
+                             "instead of flow matching")
 
     # Logging
     parser.add_argument("--use_tensorboard", action="store_true",

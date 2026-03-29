@@ -276,7 +276,7 @@ class Dreamer4MinecraftAgent:
             f"max_steps ({max_steps}) must be divisible by num_steps ({num_steps})"
         step_size = max_steps // num_steps
 
-        _, (embeds, _) = self.dynamics(
+        _, (embeds, _, _) = self.dynamics(
             latents=latents_seq,
             signal_levels=max_steps - 1,    # Clean signal (fully denoised)
             step_sizes=step_size,
@@ -360,7 +360,7 @@ if __name__ == "__main__":
         # if args.render:
         #     env.render()
         # try new version, original was laggy
-        # FIXME Interpolation wont be needed when training at full resolution
+        # FIXME Interpolation wont be needed when training at full resolution. For now on subset upscaling is fine.
         if args.render:
             frame = obs["pov"]
             frame_bgr = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_LINEAR)

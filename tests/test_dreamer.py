@@ -20,6 +20,7 @@ def exists(v):
 @param('time_attention_use_pope', (False, True))
 @param('with_latent_ar_in_dynamics', (False, True))
 @param('with_latent_ar_action_conditioned', (False, True))
+@param('use_lewm_dynamics', (False, True))
 def test_e2e(
     pred_orig_latent,
     grouped_query_attn,
@@ -35,7 +36,8 @@ def test_e2e(
     var_len,
     time_attention_use_pope,
     with_latent_ar_in_dynamics,
-    with_latent_ar_action_conditioned
+    with_latent_ar_action_conditioned,
+    use_lewm_dynamics
 ):
     from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
 
@@ -93,7 +95,12 @@ def test_e2e(
         latent_ar_layer = 0 if with_latent_ar_in_dynamics else None,
         latent_ar_loss_weight = 1. if with_latent_ar_in_dynamics else 0.,
         latent_ar_sigreg_loss_weight = 0.05 if with_latent_ar_in_dynamics else 0.,
-        latent_ar_sigreg_loss_kwargs = dict(num_slices = 2) if with_latent_ar_in_dynamics else None
+        latent_ar_sigreg_loss_kwargs = dict(num_slices = 2) if with_latent_ar_in_dynamics else None,
+        use_lewm_dynamics = use_lewm_dynamics,
+        lewm_loss_weight = 1. if use_lewm_dynamics else 0.,
+        lewm_sigreg_loss_weight = 0.05 if use_lewm_dynamics else 0.,
+        lewm_layer = 0 if use_lewm_dynamics else -1,
+        lewm_action_conditioned = condition_on_actions and use_lewm_dynamics,
     )
 
     signal_levels = step_sizes_log2 = None

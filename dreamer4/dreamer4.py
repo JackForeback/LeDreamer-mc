@@ -22,6 +22,7 @@ from torchvision.models import VGG16_Weights
 from torch.optim import Optimizer
 from adam_atan2_pytorch import MuonAdamAtan2
 
+from x_mlps_pytorch import MLP
 from x_mlps_pytorch.ensemble import Ensemble
 from x_mlps_pytorch.normed_mlp import create_mlp
 
@@ -96,9 +97,9 @@ LinearNoBias = partial(Linear, bias = False)
 
 VideoTokenizerIntermediates = namedtuple('VideoTokenizerIntermediates', ('losses', 'recon'))
 
-TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ar'))
+TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ar', 'latent_ar_sigreg'))
 
-WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred'))
+WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred', 'latent_ar_loss', 'latent_ar_sigreg_loss'))
 
 AttentionIntermediates = namedtuple('AttentionIntermediates', ('next_kv_cache', 'normed_inputs'))
 
@@ -106,7 +107,7 @@ TransformerIntermediates = namedtuple('TransformerIntermediates', ('next_kv_cach
 
 Predictions = namedtuple('Predictions', ['flow', 'proprioception', 'state'])
 
-Embeds = namedtuple('Embeds', ['agent', 'state_pred'])
+Embeds = namedtuple('Embeds', ['agent', 'state_pred', 'space_tokens'], defaults=[None])
 
 Actions = namedtuple('Actions', ['discrete', 'continuous'])
 
@@ -719,6 +720,8 @@ class ActionEmbedder(Module):
         squeeze_unembed_preds = True # will auto-squeeze if prediction is just 1
     ):
         super().__init__()
+
+        self.dim = dim
 
         self.register_buffer('dummy', tensor(0), persistent = False)
 
@@ -2641,11 +2644,28 @@ class DynamicsWorldModel(Module):
         latent_ar_action_conditioned = False,
         latent_ar_loss_weight = 0.,
         latent_ar_sigreg_loss_weight = 0.05,
-        latent_ar_sigreg_loss_kwargs: dict = dict(num_slices = 256)
+        latent_ar_sigreg_loss_kwargs: dict = dict(num_slices = 256),
+        use_lewm_dynamics = False,
+        lewm_loss_weight = 1.,
+        lewm_sigreg_loss_weight = 0.05,
+        lewm_layer: int | tuple[int, int] = -1,
+        lewm_action_conditioned = False,
+        lewm_sigreg_loss_kwargs: dict = dict(num_slices = 256)
     ):
         super().__init__()
         self.dim = dim
         self.depth = depth
+
+        # LeWM dynamics mode: use latent AR as primary dynamics loss instead of flow matching
+        self.use_lewm_dynamics = use_lewm_dynamics
+
+        if use_lewm_dynamics:
+            latent_ar = True
+            latent_ar_layer = lewm_layer
+            latent_ar_loss_weight = lewm_loss_weight
+            latent_ar_sigreg_loss_weight = lewm_sigreg_loss_weight
+            latent_ar_action_conditioned = lewm_action_conditioned
+            latent_ar_sigreg_loss_kwargs = lewm_sigreg_loss_kwargs
 
         self.has_latent_ar = latent_ar
 
@@ -2666,6 +2686,7 @@ class DynamicsWorldModel(Module):
         # spatial
 
         self.num_latent_tokens = num_latent_tokens
+        self.num_spatial_tokens = num_spatial_tokens
         self.dim_latent = dim_latent
         self.latent_shape = (num_latent_tokens, dim_latent)
 
@@ -2983,6 +3004,31 @@ class DynamicsWorldModel(Module):
             return params
 
         return list(set(params) - set(self.video_tokenizer.parameters()))
+
+    # helper for converting packed spatial tokens back to latent predictions
+
+    def _lewm_space_to_latent(self, packed_space_tokens):
+        """Convert packed spatial tokens from transformer back to latent space.
+
+        Used during LeWM generation to convert predicted next-step spatial
+        tokens into actual latent predictions.
+
+        Args:
+            packed_space_tokens: (b, t, total_packed, dim) packed spatial tokens
+        Returns:
+            (b, t, v, num_latent_tokens, dim_latent) latent predictions
+        """
+        v = self.num_video_views
+        n = self.num_latent_tokens
+        s = self.num_spatial_tokens
+
+        if s >= n:
+            expand_factor = s // n
+            space = rearrange(packed_space_tokens, 'b t (v n s) d -> b t v n s d', v=v, n=n, s=expand_factor)
+        else:
+            space = rearrange(packed_space_tokens, 'b t (v s) d -> b t v s d', v=v, s=s)
+
+        return self.to_latent_pred(space)
 
     # helpers for shortcut flow matching
 
@@ -3731,65 +3777,20 @@ class DynamicsWorldModel(Module):
             else:
                 decoded_rewards = empty((batch_size, 0), device = self.device, dtype = torch.float32)
 
+        # LeWM needs at least one seed frame to predict the next; bootstrap with random if no prompt
+        if self.use_lewm_dynamics and latents.shape[1] == 0:
+            latents = randn((batch_size, 1, self.num_video_views, *latent_shape), device = self.device)
+
         # while all the frames of the video (per latent) is not generated
 
         while latents.shape[1] < time_steps:
 
             curr_time_steps = latents.shape[1]
 
-            # determine whether to take an extra step if
-            # (1) using time kv cache
-            # (2) decoding anything off agent embedding (rewards, actions, etc)
+            if self.use_lewm_dynamics:
+                # ── LeWM generation: single forward pass + AR prediction ──
 
-            take_extra_step = (
-                use_time_cache or
-                return_rewards_per_frame or
-                store_agent_embed or
-                return_agent_actions
-            )
-
-            # prepare noised latent / proprio inputs
-
-            noised_latent = randn((batch_size, 1, self.num_video_views, *latent_shape), device = self.device)
-
-            noised_proprio = None
-
-            if has_proprio:
-                noised_proprio = randn((batch_size, 1, self.dim_proprio), device = self.device)
-
-            # denoising steps
-
-            num_iterations = num_steps + int(take_extra_step)
-
-            for step in range(num_iterations):
-
-                is_last_step = (step + 1) == num_iterations
-
-                # clamp signal levels to max_steps - 1 for the extra clean step
-
-                signal_levels_val = min(step * step_size, self.max_steps - 1)
-                signal_levels = full((batch_size, 1), signal_levels_val, dtype = torch.long, device = self.device)
-
-                # noising past latent context
-
-                noised_context = latents.lerp(past_latents_context_noise, context_signal_noise) # the paragraph after eq (8)
-
-                noised_latent_with_context, pack_context_shape = pack((noised_context, noised_latent), 'b * v n d')
-
-                # handle proprio
-
-                noised_proprio_with_context = None
-
-                if has_proprio:
-                    noised_proprio_context = proprio.lerp(past_proprio_context_noise, context_signal_noise)
-                    noised_proprio_with_context, _ = pack((noised_proprio_context, noised_proprio), 'b * d')
-
-                # proper signal levels
-
-                signal_levels_with_context = F.pad(signal_levels, (curr_time_steps, 0), value = self.max_steps - 1)
-
-                # action conditioning
-
+                # Action conditioning
                 curr_discrete = None
                 if exists(decoded_discrete_actions) and not is_empty(decoded_discrete_actions):
                     curr_discrete = decoded_discrete_actions[:, :curr_time_steps]
@@ -3800,71 +3801,189 @@ class DynamicsWorldModel(Module):
                     curr_continuous = decoded_continuous_actions[:, :curr_time_steps]
                     curr_continuous = pad_right_at_dim_to(curr_continuous, curr_time_steps, dim = 1)
 
-                # forward for prediction
-
-                pred, (embeds, next_time_cache) = self.forward(
-                    latents = noised_latent_with_context,
-                    signal_levels = signal_levels_with_context,
-                    step_sizes = step_size,
+                # Forward pass on clean latents
+                pred, (embeds, intermediates, gen_packed_shape) = self.forward(
+                    latents = latents,
+                    signal_levels = self.max_steps - 1,
+                    step_sizes = 1,
                     rewards = decoded_rewards,
                     tasks = tasks,
                     latent_gene_ids = latent_gene_ids,
                     discrete_actions = curr_discrete,
                     continuous_actions = curr_continuous,
-                    proprio = noised_proprio_with_context,
-                    time_cache = time_cache,
                     latent_is_noised = True,
                     latent_has_view_dim = True,
                     return_pred_only = True,
                     return_intermediates = True,
                 )
 
-                if use_time_cache and is_last_step:
-                    time_cache = next_time_cache
+                if use_time_cache:
+                    time_cache = intermediates
 
-                # early break if taking an extra step for agent embedding off cleaned latents for decoding
+                # Predict next latent using the latent AR predictor
+                # Extract spatial tokens from the correct transformer layer (same as training)
+                layer_hiddens = intermediates.layer_hiddens
 
-                if take_extra_step and is_last_step:
-                    break
+                if isinstance(self.latent_ar_layer, tuple):
+                    source_layer = self.latent_ar_layer[0]
+                else:
+                    source_layer = self.latent_ar_layer
 
-                # maybe proprio
+                source_hiddens = layer_hiddens[source_layer]
+                _, space_hiddens, *_ = unpack(source_hiddens, gen_packed_shape, 'b t * d')
+                last_space = space_hiddens[:, -1:]  # (b, 1, num_spatial, dim)
 
-                pred_proprio = pred.proprioception
-                pred = pred.flow
-
-                # unpack pred
-
-                _, pred = unpack(pred, pack_context_shape, 'b * v n d')
-
-                if has_proprio:
-                    _, pred_proprio = unpack(pred_proprio, pack_context_shape, 'b * d')
-
-                # derive flow, based on whether in x-space or not
-
-                def denoise_step(pred, noised, signal_levels):
-                    if self.pred_orig_latent:
-                        times = self.get_times_from_signal_level(signal_levels)
-                        aligned_times, _ = align_dims_left((times, noised))
-
-                        flow = (pred - noised) / (1. - aligned_times)
+                # Optionally condition on actions (same as training path)
+                cond_action = None
+                if self.latent_ar_action_conditioned:
+                    if exists(decoded_discrete_actions) and not is_empty(decoded_discrete_actions):
+                        action_embed = self.action_embedder(discrete_actions = decoded_discrete_actions[:, -1:])
                     else:
-                        flow = pred
+                        action_embed = torch.zeros((batch_size, 1, self.action_embedder.dim), device = self.device)
+                    cond_action = repeat(action_embed, 'b t d -> b t n d', n = last_space.shape[2])
+                    last_space = torch.cat((last_space, cond_action), dim = -1)
 
-                    return flow * (step_size / self.max_steps)
+                # AR net predicts next-step features from current-step features
+                pred_next_space = self.latent_ar.net(last_space)  # (b, 1, num_spatial, dim)
 
-                # denoise
-
-                noised_latent += denoise_step(pred, noised_latent, signal_levels)
+                # Convert predicted spatial tokens to latent
+                denoised_latent = self._lewm_space_to_latent(pred_next_space)  # (b, 1, v, n, d_latent)
 
                 if has_proprio:
-                    noised_proprio += denoise_step(pred_proprio, noised_proprio, signal_levels)
+                    # LeWM doesn't denoise proprio, use zeros as placeholder
+                    denoised_proprio = torch.zeros((batch_size, 1, self.dim_proprio), device = self.device)
 
-            denoised_latent = noised_latent # it is now denoised
+            else:
+                # ── Flow matching generation: multi-step denoising ──
 
-            if has_proprio:
-                denoised_proprio = noised_proprio
+                # determine whether to take an extra step if
+                # (1) using time kv cache
+                # (2) decoding anything off agent embedding (rewards, actions, etc)
 
-            # take care of the rewards by predicting on the agent token embedding on the last denoising step
+                take_extra_step = (
+                    use_time_cache or
+                    return_rewards_per_frame or
+                    store_agent_embed or
+                    return_agent_actions
+                )
+
+                # prepare noised latent / proprio inputs
+
+                noised_latent = randn((batch_size, 1, self.num_video_views, *latent_shape), device = self.device)
+
+                noised_proprio = None
+
+                if has_proprio:
+                    noised_proprio = randn((batch_size, 1, self.dim_proprio), device = self.device)
+
+                # denoising steps
+
+                num_iterations = num_steps + int(take_extra_step)
+
+                for step in range(num_iterations):
+
+                    is_last_step = (step + 1) == num_iterations
+
+                    # clamp signal levels to max_steps - 1 for the extra clean step
+
+                    signal_levels_val = min(step * step_size, self.max_steps - 1)
+                    signal_levels = full((batch_size, 1), signal_levels_val, dtype = torch.long, device = self.device)
+
+                    # noising past latent context
+
+                    noised_context = latents.lerp(past_latents_context_noise, context_signal_noise) # the paragraph after eq (8)
+
+                    noised_latent_with_context, pack_context_shape = pack((noised_context, noised_latent), 'b * v n d')
+
+                    # handle proprio
+
+                    noised_proprio_with_context = None
+
+                    if has_proprio:
+                        noised_proprio_context = proprio.lerp(past_proprio_context_noise, context_signal_noise)
+                        noised_proprio_with_context, _ = pack((noised_proprio_context, noised_proprio), 'b * d')
+
+                    # proper signal levels
+
+                    signal_levels_with_context = F.pad(signal_levels, (curr_time_steps, 0), value = self.max_steps - 1)
+
+                    # action conditioning
+
+                    curr_discrete = None
+                    if exists(decoded_discrete_actions) and not is_empty(decoded_discrete_actions):
+                        curr_discrete = decoded_discrete_actions[:, :curr_time_steps]
+                        curr_discrete = pad_right_at_dim_to(curr_discrete, curr_time_steps, dim = 1)
+
+                    curr_continuous = None
+                    if exists(decoded_continuous_actions) and not is_empty(decoded_continuous_actions):
+                        curr_continuous = decoded_continuous_actions[:, :curr_time_steps]
+                        curr_continuous = pad_right_at_dim_to(curr_continuous, curr_time_steps, dim = 1)
+
+                    # forward for prediction
+
+                    pred, (embeds, next_time_cache, _) = self.forward(
+                        latents = noised_latent_with_context,
+                        signal_levels = signal_levels_with_context,
+                        step_sizes = step_size,
+                        rewards = decoded_rewards,
+                        tasks = tasks,
+                        latent_gene_ids = latent_gene_ids,
+                        discrete_actions = curr_discrete,
+                        continuous_actions = curr_continuous,
+                        proprio = noised_proprio_with_context,
+                        time_cache = time_cache,
+                        latent_is_noised = True,
+                        latent_has_view_dim = True,
+                        return_pred_only = True,
+                        return_intermediates = True,
+                    )
+
+                    if use_time_cache and is_last_step:
+                        time_cache = next_time_cache
+
+                    # early break if taking an extra step for agent embedding off cleaned latents for decoding
+
+                    if take_extra_step and is_last_step:
+                        break
+
+                    # maybe proprio
+
+                    pred_proprio = pred.proprioception
+                    pred = pred.flow
+
+                    # unpack pred
+
+                    _, pred = unpack(pred, pack_context_shape, 'b * v n d')
+
+                    if has_proprio:
+                        _, pred_proprio = unpack(pred_proprio, pack_context_shape, 'b * d')
+
+                    # derive flow, based on whether in x-space or not
+
+                    def denoise_step(pred, noised, signal_levels):
+                        if self.pred_orig_latent:
+                            times = self.get_times_from_signal_level(signal_levels)
+                            aligned_times, _ = align_dims_left((times, noised))
+
+                            flow = (pred - noised) / (1. - aligned_times)
+                        else:
+                            flow = pred
+
+                        return flow * (step_size / self.max_steps)
+
+                    # denoise
+
+                    noised_latent += denoise_step(pred, noised_latent, signal_levels)
+
+                    if has_proprio:
+                        noised_proprio += denoise_step(pred_proprio, noised_proprio, signal_levels)
+
+                denoised_latent = noised_latent # it is now denoised
+
+                if has_proprio:
+                    denoised_proprio = noised_proprio
+
+            # take care of the rewards by predicting on the agent token embedding
 
             if return_rewards_per_frame:
                 agent_embed = embeds.agent
@@ -3941,6 +4060,88 @@ class DynamicsWorldModel(Module):
                 proprio = cat((proprio, denoised_proprio), dim = 1)
 
                 past_proprio_context_noise = cat((past_proprio_context_noise, randn_like(denoised_proprio)), dim = 1)
+
+        # LeWM: final forward pass to decode agent embed for the last generated frame
+        # (the loop decodes rewards/actions from the forward pass *before* appending,
+        #  so the last appended frame has no decoded agent embed yet)
+
+        if self.use_lewm_dynamics and has_at_least_one(return_rewards_per_frame, store_agent_embed, return_agent_actions):
+            curr_discrete = None
+            if exists(decoded_discrete_actions) and not is_empty(decoded_discrete_actions):
+                curr_discrete = decoded_discrete_actions[:, :latents.shape[1]]
+                curr_discrete = pad_right_at_dim_to(curr_discrete, latents.shape[1], dim = 1)
+
+            curr_continuous = None
+            if exists(decoded_continuous_actions) and not is_empty(decoded_continuous_actions):
+                curr_continuous = decoded_continuous_actions[:, :latents.shape[1]]
+                curr_continuous = pad_right_at_dim_to(curr_continuous, latents.shape[1], dim = 1)
+
+            _, (embeds, _, _) = self.forward(
+                latents = latents,
+                signal_levels = self.max_steps - 1,
+                step_sizes = 1,
+                rewards = decoded_rewards,
+                tasks = tasks,
+                latent_gene_ids = latent_gene_ids,
+                discrete_actions = curr_discrete,
+                continuous_actions = curr_continuous,
+                latent_is_noised = True,
+                latent_has_view_dim = True,
+                return_pred_only = True,
+                return_intermediates = True,
+            )
+
+            if return_rewards_per_frame:
+                agent_embed = embeds.agent
+                one_agent_embed = agent_embed[:, -1:, agent_index]
+                reward_logits = self.to_reward_pred.forward_one(one_agent_embed, id = 0)
+                pred_reward = self.reward_encoder.bins_to_scalar_value(reward_logits, normalize = True)
+                decoded_rewards = cat((decoded_rewards, pred_reward), dim = 1)
+
+            if store_agent_embed:
+                agent_embed = embeds.agent
+                one_agent_embed = agent_embed[:, -1:, agent_index]
+                acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
+
+            if return_agent_actions:
+                agent_embed = embeds.agent
+                one_agent_embed = agent_embed[:, -1:, agent_index]
+                policy_embed = self.policy_head(one_agent_embed)
+
+                if store_old_action_unembeds:
+                    acc_policy_embed = safe_cat((acc_policy_embed, policy_embed), dim = 1)
+
+                sampled_discrete_actions, sampled_continuous_actions = self.action_embedder.sample(
+                    policy_embed,
+                    pred_head_index = 0,
+                    squeeze = True,
+                    discrete_temperature = discrete_temperature,
+                    continuous_temperature = continuous_temperature
+                )
+
+                if exists(sampled_discrete_actions):
+                    decoded_discrete_actions = safe_cat((decoded_discrete_actions, sampled_discrete_actions), dim = 1)
+
+                if exists(sampled_continuous_actions):
+                    decoded_continuous_actions = safe_cat((decoded_continuous_actions, sampled_continuous_actions), dim = 1)
+
+                if return_log_probs_and_values:
+                    discrete_log_probs, continuous_log_probs = self.action_embedder.log_probs(
+                        policy_embed,
+                        discrete_targets = sampled_discrete_actions,
+                        continuous_targets = sampled_continuous_actions,
+                        pred_head_index = 0,
+                    )
+
+                    if exists(discrete_log_probs):
+                        decoded_discrete_log_probs = safe_cat((decoded_discrete_log_probs, discrete_log_probs), dim = 1)
+
+                    if exists(continuous_log_probs):
+                        decoded_continuous_log_probs = safe_cat((decoded_continuous_log_probs, continuous_log_probs), dim = 1)
+
+                    value_bins = self.value_head(one_agent_embed)
+                    values = self.reward_encoder.bins_to_scalar_value(value_bins)
+                    decoded_values = safe_cat((decoded_values, values), dim = 1)
 
         # restore state
 
@@ -4142,19 +4343,25 @@ class DynamicsWorldModel(Module):
 
         if not is_inference:
 
-            shortcut_train = _sample_prob(self.prob_shortcut_train)
-
-            if shortcut_train:
-
-                # now we follow eq (4)
-
-                step_sizes_log2 = _randint(1, self.num_step_sizes_log2, (batch,), device = device)
-                num_step_sizes = 2 ** step_sizes_log2
-
-                signal_levels = _randint(0, self.max_steps, (batch, time), device = device) // num_step_sizes[:, None] * num_step_sizes[:, None] # times are discretized to step sizes
+            if self.use_lewm_dynamics:
+                # LeWM mode: always use clean signal levels (no noising)
+                step_sizes_log2 = torch.zeros((batch,), device = device).long()
+                signal_levels = full((batch, time), self.max_steps - 1, dtype = torch.long, device = device)
+                shortcut_train = False
             else:
-                step_sizes_log2 = torch.zeros((batch,), device = device).long() # zero because zero is equivalent to step size of 1
-                signal_levels = _randint(0, self.max_steps, (batch, time), device = device)
+                shortcut_train = _sample_prob(self.prob_shortcut_train)
+
+                if shortcut_train:
+
+                    # now we follow eq (4)
+
+                    step_sizes_log2 = _randint(1, self.num_step_sizes_log2, (batch,), device = device)
+                    num_step_sizes = 2 ** step_sizes_log2
+
+                    signal_levels = _randint(0, self.max_steps, (batch, time), device = device) // num_step_sizes[:, None] * num_step_sizes[:, None] # times are discretized to step sizes
+                else:
+                    step_sizes_log2 = torch.zeros((batch,), device = device).long() # zero because zero is equivalent to step size of 1
+                    signal_levels = _randint(0, self.max_steps, (batch, time), device = device)
 
         # times is from 0 to 1
 
@@ -4166,7 +4373,12 @@ class DynamicsWorldModel(Module):
             # update signal levels for the embeddings so it reflects the modified noise level
             signal_levels = (times * self.max_steps).long().clamp(0, self.max_steps - 1)
 
-        if not latent_is_noised:
+        noise = None
+
+        if self.use_lewm_dynamics or latent_is_noised:
+            # LeWM mode or pre-noised: use latents directly
+            noised_latents = latents
+        else:
             # get the noise
 
             noise = _randn_like(latents)
@@ -4175,9 +4387,6 @@ class DynamicsWorldModel(Module):
             # noise from 0 as noise to 1 as data
 
             noised_latents = noise.lerp(latents, aligned_times)
-
-        else:
-            noised_latents = latents
 
         # reinforcement learning related
 
@@ -4355,6 +4564,9 @@ class DynamicsWorldModel(Module):
 
             flow_token, space_tokens, proprio_token, state_pred_token, register_tokens, action_tokens, reward_tokens, agent_tokens = unpack(tokens, packed_tokens_shape, 'b t * d')
 
+            # store packed spatial tokens for LeWM generation before inverse_pack
+            packed_space_tokens = space_tokens
+
             # pooling
 
             space_tokens = inverse_pack_space_per_latent(space_tokens)
@@ -4379,7 +4591,7 @@ class DynamicsWorldModel(Module):
 
             predictions = Predictions(pred, pred_proprio, pred_state)
 
-            embeds = Embeds(agent_tokens, state_pred_token)
+            embeds = Embeds(agent_tokens, state_pred_token, packed_space_tokens)
 
             if not return_agent_tokens:
                 return predictions
@@ -4401,153 +4613,160 @@ class DynamicsWorldModel(Module):
             if not return_intermediates:
                 return pred
 
-            return pred, (embeds, intermediates)
+            return pred, (embeds, intermediates, packed_tokens_shape)
 
-        # pack the predictions to calculate flow for different modalities all at once
-
-        if self.has_proprio:
-            packed_pred, for_flow_loss_packed_shape = pack((pred.flow, pred.proprioception), 'b t *')
-
-            noised, _ = pack((noised_latents, noised_proprio), 'b t *')
-            data, _ = pack((latents, proprio), 'b t *')
-            noise, _ = pack((noise, proprio_noise), 'b t *')
-        else:
-            packed_pred = pred.flow
-            noised = noised_latents
-            data = latents
-
-        # wrapper function for maybe unpacking and packing modalities for doing flow math in unison
-
-        def maybe_pack_unpack(fn):
-            @wraps(fn)
-            @torch.no_grad()
-            def inner(noised, *args, **kwargs):
-
-                noised_proprio = None
-
-                if self.has_proprio:
-                    noised, noised_proprio = unpack(noised, for_flow_loss_packed_shape, 'b t *')
-
-                pred = fn(noised, noised_proprio, *args, **kwargs)
-
-                if self.has_proprio:
-                    packed_flow, _ = pack((pred.flow, pred.proprioception), 'b t *')
-                    return packed_flow
-
-                return pred.flow
-            return inner
-
-        wrapped_get_prediction = maybe_pack_unpack(_get_prediction)
-
-        # determine the targets for the standard and shortcut losses
-
-        is_x_space = self.pred_orig_latent
-        is_v_space_pred = not self.pred_orig_latent
-
-        # flow loss prep
-
-        if is_v_space_pred:
-            pred_target = data - noise
-            pred = packed_pred
-        else:
-            pred_target = data
-            pred = packed_pred
-
-        # flow loss
-
-        flow_loss_weight = 1.
-
-        if is_x_space:
-            flow_loss_weight = (1. - times) ** 2
-
-        flow_losses = F.mse_loss(pred, pred_target, reduction = 'none')
-
-        if is_tensor(flow_loss_weight):
-            flow_loss_weight, _ = align_dims_left((flow_loss_weight, flow_losses))
-
-        flow_losses = flow_losses * flow_loss_weight
-
-        # shortcut loss
-
-        should_compute_shortcut = not is_inference and shortcut_train
-
-        if should_compute_shortcut:
-            step_sizes_log2_minus_one = step_sizes_log2 - 1 # which equals d / 2
-            half_step_size = 2 ** step_sizes_log2_minus_one
-
-            first_step_pred = wrapped_get_prediction(noised, signal_levels, step_sizes_log2_minus_one)
-
-            # first derive b'
-
-            if is_v_space_pred:
-                first_step_pred_flow = first_step_pred
-            else:
-                first_times = self.get_times_from_signal_level(signal_levels, noised)
-
-                first_step_pred_flow = (first_step_pred - noised) / (1. - first_times)
-
-            # take a half step
-
-            half_step_size_align_left, _ = align_dims_left((half_step_size, noised))
-
-            denoised = noised + first_step_pred_flow * (half_step_size_align_left / self.max_steps)
-
-            # get second prediction for b''
-
-            signal_levels_plus_half_step = signal_levels + half_step_size[:, None]
-            second_step_pred = wrapped_get_prediction(denoised, signal_levels_plus_half_step, step_sizes_log2_minus_one)
-
-            if is_v_space_pred:
-                second_step_pred_flow = second_step_pred
-            else:
-                second_times = self.get_times_from_signal_level(signal_levels_plus_half_step, denoised)
-                second_step_pred_flow = (second_step_pred - denoised) / (1. - second_times)
-
-            # pred target is sg(b' + b'') / 2
-
-            shortcut_pred_target = (first_step_pred_flow + second_step_pred_flow).detach() / 2
-            shortcut_pred = packed_pred
-
-            # shortcut loss
-
-            shortcut_loss_weight = 1.
-
-            if is_x_space:
-                shortcut_pred = (shortcut_pred - noised) / (1. - first_times)
-                shortcut_loss_weight = (1. - first_times) ** 2
-
-            if is_tensor(shortcut_loss_weight):
-                shortcut_loss_weight, _ = align_dims_left((shortcut_loss_weight, shortcut_pred_target))
-
-            shortcut_flow_losses = F.mse_loss(shortcut_pred, shortcut_pred_target, reduction = 'none')
-            shortcut_flow_losses = shortcut_flow_losses * shortcut_loss_weight
-        else:
-            shortcut_flow_losses = torch.zeros_like(flow_losses)
-
-        # loss weighting with their ramp function
-
-        if exists(self.loss_weight_fn):
-            loss_weight = self.loss_weight_fn(times)
-            loss_weight, _ = align_dims_left((loss_weight, flow_losses))
-
-            flow_losses = flow_losses * loss_weight
-
-        # handle variable lengths if needed
+        # handle variable lengths if needed (shared by flow matching and LeWM paths)
 
         is_var_len = exists(lens)
         loss_mask = loss_mask_without_last = None
 
         if is_var_len:
-
             loss_mask = lens_to_mask(lens, time)
             loss_mask_without_last = loss_mask[:, :-1]
 
-            flow_loss = flow_losses[loss_mask].mean()
-            shortcut_flow_loss = shortcut_flow_losses[loss_mask].mean() if should_compute_shortcut else self.zero
+        if self.use_lewm_dynamics:
+            # LeWM mode: latent AR loss is the primary dynamics loss, skip flow matching
+            flow_loss = self.zero
+            shortcut_flow_loss = self.zero
 
         else:
-            flow_loss = flow_losses.mean()
-            shortcut_flow_loss = shortcut_flow_losses.mean() if should_compute_shortcut else self.zero
+            # pack the predictions to calculate flow for different modalities all at once
+
+            if self.has_proprio:
+                packed_pred, for_flow_loss_packed_shape = pack((pred.flow, pred.proprioception), 'b t *')
+
+                noised, _ = pack((noised_latents, noised_proprio), 'b t *')
+                data, _ = pack((latents, proprio), 'b t *')
+                noise, _ = pack((noise, proprio_noise), 'b t *')
+            else:
+                packed_pred = pred.flow
+                noised = noised_latents
+                data = latents
+
+            # wrapper function for maybe unpacking and packing modalities for doing flow math in unison
+
+            def maybe_pack_unpack(fn):
+                @wraps(fn)
+                @torch.no_grad()
+                def inner(noised, *args, **kwargs):
+
+                    noised_proprio = None
+
+                    if self.has_proprio:
+                        noised, noised_proprio = unpack(noised, for_flow_loss_packed_shape, 'b t *')
+
+                    pred = fn(noised, noised_proprio, *args, **kwargs)
+
+                    if self.has_proprio:
+                        packed_flow, _ = pack((pred.flow, pred.proprioception), 'b t *')
+                        return packed_flow
+
+                    return pred.flow
+                return inner
+
+            wrapped_get_prediction = maybe_pack_unpack(_get_prediction)
+
+            # determine the targets for the standard and shortcut losses
+
+            is_x_space = self.pred_orig_latent
+            is_v_space_pred = not self.pred_orig_latent
+
+            # flow loss prep
+
+            if is_v_space_pred:
+                pred_target = data - noise
+                pred = packed_pred
+            else:
+                pred_target = data
+                pred = packed_pred
+
+            # flow loss
+
+            flow_loss_weight = 1.
+
+            if is_x_space:
+                flow_loss_weight = (1. - times) ** 2
+
+            flow_losses = F.mse_loss(pred, pred_target, reduction = 'none')
+
+            if is_tensor(flow_loss_weight):
+                flow_loss_weight, _ = align_dims_left((flow_loss_weight, flow_losses))
+
+            flow_losses = flow_losses * flow_loss_weight
+
+            # shortcut loss
+
+            should_compute_shortcut = not is_inference and shortcut_train
+
+            if should_compute_shortcut:
+                step_sizes_log2_minus_one = step_sizes_log2 - 1 # which equals d / 2
+                half_step_size = 2 ** step_sizes_log2_minus_one
+
+                first_step_pred = wrapped_get_prediction(noised, signal_levels, step_sizes_log2_minus_one)
+
+                # first derive b'
+
+                if is_v_space_pred:
+                    first_step_pred_flow = first_step_pred
+                else:
+                    first_times = self.get_times_from_signal_level(signal_levels, noised)
+
+                    first_step_pred_flow = (first_step_pred - noised) / (1. - first_times)
+
+                # take a half step
+
+                half_step_size_align_left, _ = align_dims_left((half_step_size, noised))
+
+                denoised = noised + first_step_pred_flow * (half_step_size_align_left / self.max_steps)
+
+                # get second prediction for b''
+
+                signal_levels_plus_half_step = signal_levels + half_step_size[:, None]
+                second_step_pred = wrapped_get_prediction(denoised, signal_levels_plus_half_step, step_sizes_log2_minus_one)
+
+                if is_v_space_pred:
+                    second_step_pred_flow = second_step_pred
+                else:
+                    second_times = self.get_times_from_signal_level(signal_levels_plus_half_step, denoised)
+                    second_step_pred_flow = (second_step_pred - denoised) / (1. - second_times)
+
+                # pred target is sg(b' + b'') / 2
+
+                shortcut_pred_target = (first_step_pred_flow + second_step_pred_flow).detach() / 2
+                shortcut_pred = packed_pred
+
+                # shortcut loss
+
+                shortcut_loss_weight = 1.
+
+                if is_x_space:
+                    shortcut_pred = (shortcut_pred - noised) / (1. - first_times)
+                    shortcut_loss_weight = (1. - first_times) ** 2
+
+                if is_tensor(shortcut_loss_weight):
+                    shortcut_loss_weight, _ = align_dims_left((shortcut_loss_weight, shortcut_pred_target))
+
+                shortcut_flow_losses = F.mse_loss(shortcut_pred, shortcut_pred_target, reduction = 'none')
+                shortcut_flow_losses = shortcut_flow_losses * shortcut_loss_weight
+            else:
+                shortcut_flow_losses = torch.zeros_like(flow_losses)
+
+            # loss weighting with their ramp function
+
+            if exists(self.loss_weight_fn):
+                loss_weight = self.loss_weight_fn(times)
+                loss_weight, _ = align_dims_left((loss_weight, flow_losses))
+
+                flow_losses = flow_losses * loss_weight
+
+            # compute scalar flow and shortcut losses
+
+            if is_var_len:
+                flow_loss = flow_losses[loss_mask].mean()
+                shortcut_flow_loss = shortcut_flow_losses[loss_mask].mean() if should_compute_shortcut else self.zero
+            else:
+                flow_loss = flow_losses.mean()
+                shortcut_flow_loss = shortcut_flow_losses.mean() if should_compute_shortcut else self.zero
 
         # now take care of the agent token losses
 
@@ -4582,7 +4801,7 @@ class DynamicsWorldModel(Module):
         state_pred_loss = self.zero
 
         if self.should_pred_state:
-            pred_latent, latent_to_pred = state_pred_logits[:, :-1], latents[:, 1:]
+            pred_latent, latent_to_pred = pred.state[:, :-1], latents[:, 1:]
 
             dist = self.state_beta_dist(pred_latent)
 
