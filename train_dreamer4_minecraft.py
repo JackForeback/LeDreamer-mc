@@ -4,7 +4,7 @@ Training script for Dreamer4 on Minecraft using VPT data.
 This script implements the full 3-phase Dreamer4 training pipeline:
 
   Phase 1: Video Tokenizer Training
-    Train the VideoTokenizer to compress 128x128 Minecraft frames into
+    Train the VideoTokenizer to compress 384x640 Minecraft frames into
     compact latent representations. Uses MAE-style masking, LPIPS perceptual
     loss, and axial space-time attention.
 
@@ -61,16 +61,16 @@ from minecraft_vpt_dataset import (
 
 # ─── Default Hyperparameters ────────────────────────────────────────
 
-# These are reasonable defaults for Minecraft at 128x128 resolution.
-# The Dreamer4 paper uses larger models; scale up if you have more GPU memory.
+# Paper-matched defaults for Minecraft at 384x640 resolution (360x640 zero-padded).
+# See data.txt: 16x16 patches → 960 tokens, bottleneck (N_b=512)x(D_b=16).
 
 TOKENIZER_DEFAULTS = dict(
     dim=256,                    # Hidden dimension of transformer
-    dim_latent=32,              # Latent bottleneck dimension
-    patch_size=8,               # 128/8 = 16x16 spatial patches
-    image_height=128,           # VPT observation resolution
-    image_width=128,
-    num_latent_tokens=16,       # Number of latent tokens per frame
+    dim_latent=16,              # Latent bottleneck dimension (D_b=16)
+    patch_size=16,              # 384/16=24, 640/16=40 → 960 patch tokens
+    image_height=384,           # VPT 360x640 zero-padded to 384x640
+    image_width=640,
+    num_latent_tokens=512,      # Bottleneck token count (N_b=512)
     encoder_depth=4,            # Transformer depth
     decoder_depth=4,
     time_block_every=4,         # Temporal attention every 4th block
@@ -83,11 +83,11 @@ TOKENIZER_DEFAULTS = dict(
 
 DYNAMICS_DEFAULTS = dict(
     dim=256,                    # Hidden dimension
-    dim_latent=32,              # Must match tokenizer
+    dim_latent=16,              # Must match tokenizer (D_b=16)
     max_steps=64,               # K_max for flow matching (power of 2)
     num_register_tokens=8,      # Register tokens for temporal consistency
-    num_spatial_tokens=2,       # Latents projected to spatial tokens
-    num_latent_tokens=16,       # Must match tokenizer
+    num_spatial_tokens=256,     # Paper: N_z=256 spatial tokens
+    num_latent_tokens=512,      # Must match tokenizer (N_b=512)
     depth=8,                    # Transformer depth
     time_block_every=4,
     attn_heads=4,
@@ -142,16 +142,16 @@ TRAINING_DEFAULTS = dict(
 def train_tokenizer(args):
     """Train the VideoTokenizer on Minecraft video data.
 
-    The tokenizer learns to compress 128x128 RGB frames into compact
+    The tokenizer learns to compress 384x640 RGB frames into compact
     latent representations using:
-      - Patch embedding (8x8 patches → 16x16 spatial grid)
+      - Patch embedding (16x16 patches → 24x40 spatial grid)
       - Axial space-time transformer encoder
       - Latent bottleneck with Tanh activation
       - MAE-style patch masking for regularization
       - LPIPS perceptual loss for visual quality
       - Temporal/spatial decorrelation losses
 
-    The encoder output shape per frame: (num_latent_tokens, dim_latent) = (16, 32)
+    The encoder output shape per frame: (num_latent_tokens, dim_latent) = (512, 16)
     """
     print("=" * 60)
     print("PHASE 1: Training Video Tokenizer")
@@ -162,8 +162,8 @@ def train_tokenizer(args):
         data_dir=args.data_dir,
         seq_len=args.tokenizer_seq_len,
         stride=args.tokenizer_seq_len // 2,
-        image_height=128,
-        image_width=128,
+        image_height=384,
+        image_width=640,
         max_trajectories=args.max_trajectories,
     )
 
@@ -265,8 +265,8 @@ def train_dynamics(args):
         data_dir=args.data_dir,
         seq_len=args.dynamics_seq_len,
         stride=args.dynamics_seq_len // 2,
-        image_height=128,
-        image_width=128,
+        image_height=384,
+        image_width=640,
         max_trajectories=args.max_trajectories,
     )
 

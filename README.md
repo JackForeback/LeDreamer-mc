@@ -13,6 +13,9 @@ Both variants share the same transformer backbone, action space, training infras
 
 Forked from [lucidrains/dreamer4](https://github.com/lucidrains/dreamer4). Evaluation uses [openai/Video-Pre-Training](https://github.com/openai/Video-Pre-Training) as a git subtree.
 
+**Disclaimer: This is a preliminary implementation. All criticism and suggestions for improvement are welcome and encouraged.**
+
+
 ## Table of Contents
 
 - [Installation](#installation)
@@ -69,7 +72,7 @@ LeDreamer-mc trains on [OpenAI VPT](https://github.com/openai/Video-Pre-Training
 
 Place your `.mp4`/`.jsonl` pairs in a directory (e.g., `./download/data/`). The dataset loader (`minecraft_vpt_dataset.py`) handles all preprocessing automatically:
 
-- Downscales video frames from 640x360 to 128x128
+- Zero-pads video frames from 640x360 to 640x384 (matching the paper's preprocessing)
 - Converts VPT's action format to Dreamer4's discrete action space
 - Filters null actions (matching the VPT paper's preprocessing)
 - Applies mu-law camera quantization (11x11 = 121 bins)
@@ -83,7 +86,7 @@ All three training phases use a single entry point with `--phase 1|2|3`. Each ph
 
 ### Phase 1: Video Tokenizer
 
-Trains a **VideoTokenizer** to compress 128x128 Minecraft frames into compact latent representations using:
+Trains a **VideoTokenizer** to compress 384x640 Minecraft frames (zero-padded from native 360x640) into compact latent representations using:
 
 - MAE-style patch masking for regularization
 - LPIPS perceptual loss for visual quality
@@ -246,7 +249,7 @@ For a detailed explanation of the LeWM implementation, see [`LEWM.md`](LEWM.md).
 ### Overview
 
 ```
-Phase 1: VideoTokenizer       Encode 128x128 video to latents (MAE + LPIPS) (Will be changed to 384x640 to reflect actual paper)
+Phase 1: VideoTokenizer       Encode 384x640 video to latents (MAE + LPIPS)
              |                          checkpoints/tokenizer.pt
              v
 Phase 2: DynamicsWorldModel    Learn latent dynamics from VPT data + actions

@@ -251,8 +251,8 @@ def env_action_to_dreamer4(env_action: dict) -> np.ndarray:
 def load_trajectory(
     video_path: str,
     jsonl_path: str,
-    target_height: int = 128,
-    target_width: int = 128,
+    target_height: int = 384,
+    target_width: int = 640,
     skip_null_actions: bool = True,
 ) -> tuple:
     """Load a single VPT recording into arrays.
@@ -350,9 +350,21 @@ def load_trajectory(
         cv2.cvtColor(frame, code=cv2.COLOR_BGR2RGB, dst=frame)
         frame = np.clip(frame, 0, 255).astype(np.uint8)
 
-        # Resize to target resolution
-        frame = cv2.resize(frame, (target_width, target_height),
-                           interpolation=cv2.INTER_LINEAR)
+        # Zero-pad to target resolution (paper: 360x640 → 384x640)
+        # If native resolution matches target width, pad height only;
+        # otherwise fall back to resize for non-standard source video.
+        h, w = frame.shape[:2]
+        if w == target_width and h < target_height:
+            pad_total = target_height - h
+            pad_top = pad_total // 2
+            pad_bottom = pad_total - pad_top
+            frame = cv2.copyMakeBorder(
+                frame, pad_top, pad_bottom, 0, 0,
+                cv2.BORDER_CONSTANT, value=(0, 0, 0)
+            )
+        elif h != target_height or w != target_width:
+            frame = cv2.resize(frame, (target_width, target_height),
+                               interpolation=cv2.INTER_LINEAR)
 
         # Convert to Dreamer4 action format
         d4_action = env_action_to_dreamer4(env_action)
@@ -470,14 +482,34 @@ def prescan_trajectory(
 
 # ─── Frame Decoding Backends ───────────────────────────────────────
 
+def _zero_pad_frame(frame, image_height, image_width):
+    """Zero-pad a frame to (image_height, image_width) if width matches.
+
+    Follows the paper: 360x640 → 384x640 via symmetric zero-padding on height.
+    Falls back to resize if dimensions are unexpected.
+    """
+    h, w = frame.shape[:2]
+    if w == image_width and h < image_height:
+        pad_total = image_height - h
+        pad_top = pad_total // 2
+        pad_bottom = pad_total - pad_top
+        return cv2.copyMakeBorder(
+            frame, pad_top, pad_bottom, 0, 0,
+            cv2.BORDER_CONSTANT, value=(0, 0, 0)
+        )
+    elif h != image_height or w != image_width:
+        return cv2.resize(frame, (image_width, image_height),
+                          interpolation=cv2.INTER_LINEAR)
+    return frame
+
+
 def _decode_frames_decord(mp4_path, frame_indices, image_height, image_width):
     """Decode specific frames from MP4 using decord (fast random access)."""
     vr = decord.VideoReader(mp4_path, num_threads=1)
     frames = vr.get_batch(frame_indices.tolist()).asnumpy()  # (T, H, W, 3) RGB
     if frames.shape[1] != image_height or frames.shape[2] != image_width:
         frames = np.stack([
-            cv2.resize(f, (image_width, image_height), interpolation=cv2.INTER_LINEAR)
-            for f in frames
+            _zero_pad_frame(f, image_height, image_width) for f in frames
         ])
     return frames
 
@@ -503,8 +535,7 @@ def _decode_frames_cv2(mp4_path, frame_indices, image_height, image_width):
             break
         if raw_idx in needed:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame = cv2.resize(frame, (image_width, image_height),
-                               interpolation=cv2.INTER_LINEAR)
+            frame = _zero_pad_frame(frame, image_height, image_width)
             frames[raw_idx] = frame
     cap.release()
 
@@ -544,8 +575,8 @@ class MinecraftVPTDataset(Dataset):
         data_dir: str,
         seq_len: int = 16,
         stride: int = 8,
-        image_height: int = 128,
-        image_width: int = 128,
+        image_height: int = 384,
+        image_width: int = 640,
         skip_null_actions: bool = True,
         max_trajectories: Optional[int] = None,
     ):

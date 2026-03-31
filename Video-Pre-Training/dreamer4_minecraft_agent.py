@@ -13,7 +13,7 @@ non-existent 'model' module. This version uses the actual Dreamer4 API:
 
 Inference pipeline at each step:
   1. Receive MineRL observation dict with "pov" key (H, W, 3) uint8
-  2. Resize to 128x128, convert to (1, 3, 1, 128, 128) float tensor
+  2. Zero-pad to 384x640, convert to (1, 3, 1, 384, 640) float tensor
   3. VideoTokenizer.tokenize() → latent (1, 1, num_latents, dim_latent)
   4. Concatenate with history latents, add view dim for DynamicsWorldModel
   5. DynamicsWorldModel.forward() with signal_level=max_steps-1 (clean)
@@ -46,7 +46,7 @@ sys.path.insert(0, _project_root)                             # dreamer4 package
 
 from dreamer4 import VideoTokenizer, DynamicsWorldModel
 
-from agent import AGENT_RESOLUTION, ENV_KWARGS, validate_env, resize_image
+from agent import ENV_KWARGS, validate_env, resize_image
 from lib.actions import ActionTransformer, Buttons
 
 from minecraft_vpt_dataset import (
@@ -208,14 +208,25 @@ class Dreamer4MinecraftAgent:
         Returns:
             latents: (1, 1, num_latent_tokens, dim_latent) tensor
         """
-        # Extract and resize image
-        frame = minerl_obs["pov"]  # (H, W, 3) uint8
-        frame = resize_image(frame, AGENT_RESOLUTION)  # (128, 128, 3) uint8
+        # Extract frame and zero-pad to 384x640 (paper: 360x640 → 384x640)
+        frame = minerl_obs["pov"]  # (H, W, 3) uint8, typically 360x640
+        h, w = frame.shape[:2]
+        target_h, target_w = 384, 640
+        if w == target_w and h < target_h:
+            pad_total = target_h - h
+            pad_top = pad_total // 2
+            pad_bottom = pad_total - pad_top
+            frame = cv2.copyMakeBorder(
+                frame, pad_top, pad_bottom, 0, 0,
+                cv2.BORDER_CONSTANT, value=(0, 0, 0)
+            )
+        elif h != target_h or w != target_w:
+            frame = resize_image(frame, (target_w, target_h))
 
-        # Convert to (1, 3, 1, 128, 128) float tensor
+        # Convert to (1, 3, 1, 384, 640) float tensor
         frame_t = torch.from_numpy(frame).float() / 255.0
-        frame_t = frame_t.permute(2, 0, 1)  # (3, 128, 128)
-        video = frame_t.unsqueeze(0).unsqueeze(2).to(self.device)  # (1, 3, 1, 128, 128)
+        frame_t = frame_t.permute(2, 0, 1)  # (3, 384, 640)
+        video = frame_t.unsqueeze(0).unsqueeze(2).to(self.device)  # (1, 3, 1, 384, 640)
 
         # Tokenize: returns (1, 1, num_latents, dim_latent)
         latents = self.tokenizer.tokenize(video)
@@ -357,14 +368,9 @@ if __name__ == "__main__":
 
         if step % 100 == 0:
             print(f"Step {step}, reward: {total_reward:.2f}")
-        # if args.render:
-        #     env.render()
-        # try new version, original was laggy
-        # FIXME Interpolation wont be needed when training at full resolution. For now on subset upscaling is fine.
         if args.render:
-            frame = obs["pov"]
-            frame_bgr = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_LINEAR)
-            cv2.imshow("Dreamer4 Minecraft", frame_bgr[:, :, ::-1])
+            frame = obs["pov"]  # (360, 640, 3) native resolution
+            cv2.imshow("Dreamer4 Minecraft", frame[:, :, ::-1])
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
         if done:
