@@ -204,7 +204,8 @@ def train_tokenizer(args):
         log_video=args.log_video,
         video_fps=20,
         log_video_every=args.log_video_every,
-    )
+        checkpoint_folder=args.output_dir
+        )
 
     trainer()
 
@@ -302,7 +303,8 @@ def train_dynamics(args):
         cpu=not torch.cuda.is_available(),
         use_tensorboard_logger=args.use_tensorboard,
         log_dir=args.output_dir,
-    )
+        checkpoint_folder=args.output_dir
+        )
 
     trainer()
 
