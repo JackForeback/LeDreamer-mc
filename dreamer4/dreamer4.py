@@ -1,12 +1,13 @@
 from __future__ import annotations
 from typing import Callable, Optional
 
+import numpy as np
 from math import ceil, log2
 from random import random
 from contextlib import nullcontext
 from collections import namedtuple
 from functools import partial, wraps
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 
 import torch
 import torch.nn.functional as F
@@ -41,6 +42,7 @@ from torch_einops_utils import (
     maybe,
     align_dims_left,
     pad_at_dim,
+    pad_right_at_dim,
     pad_right_at_dim_to,
     pad_right_ndim_to,
     lens_to_mask,
@@ -73,7 +75,7 @@ from torch_einops_utils.save_load import save_load
 # v - video viewpoints
 
 import einx
-from einx import add, multiply
+from einx import add, multiply, equal, logical_and
 from einops import einsum, rearrange, repeat, reduce, pack, unpack
 from einops.layers.torch import Rearrange, Reduce
 
@@ -99,11 +101,11 @@ VideoTokenizerIntermediates = namedtuple('VideoTokenizerIntermediates', ('losses
 
 TokenizerLosses = namedtuple('TokenizerLosses', ('recon', 'lpips', 'time_decorr', 'space_decorr', 'latent_ar', 'latent_ar_sigreg'))
 
-WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred', 'latent_ar_loss', 'latent_ar_sigreg_loss'))
+WorldModelLosses = namedtuple('WorldModelLosses', ('flow', 'shortcut', 'rewards', 'terminals', 'discrete_actions', 'continuous_actions', 'state_pred', 'agent_state_pred', 'latent_ar', 'latent_ar_sigreg'))
 
 AttentionIntermediates = namedtuple('AttentionIntermediates', ('next_kv_cache', 'normed_inputs'))
 
-TransformerIntermediates = namedtuple('TransformerIntermediates', ('next_kv_cache', 'normed_time_inputs', 'normed_space_inputs', 'next_rnn_hiddens', 'layer_hiddens'), defaults=(None,))
+TransformerIntermediates = namedtuple('TransformerIntermediates', ('next_kv_cache', 'normed_time_inputs', 'normed_space_inputs', 'next_rnn_hiddens', 'layer_hiddens', 'token_count'), defaults=(None, None, None, None, None, 0))
 
 Predictions = namedtuple('Predictions', ['flow', 'proprioception', 'state'])
 
@@ -119,8 +121,10 @@ class Experience:
     latents: Tensor
     video: MaybeTensor = None
     proprio: MaybeTensor = None
+    critic_state: MaybeTensor = None
     agent_embed: MaybeTensor = None
     rewards: Tensor | None = None
+    terminals: Tensor | None = None
     actions: Actions | None = None
     log_probs: Actions | None = None
     old_action_unembeds: tuple[MaybeTensor, MaybeTensor] | None = None
@@ -130,12 +134,13 @@ class Experience:
     is_truncated: MaybeTensor = None
     agent_index: int = 0
     is_from_world_model: bool | Tensor = True
+    episode_return: Tensor | None = None
 
     def cpu(self):
         return self.to(torch.device('cpu'))
 
     def to(self, device):
-        experience_dict = asdict(self)
+        experience_dict = {f.name: getattr(self, f.name) for f in fields(self)}
         experience_dict = tree_map(lambda t: t.to(device) if is_tensor(t) else t, experience_dict)
         return Experience(**experience_dict)
 
@@ -148,8 +153,8 @@ def combine_experiences(
     # set lens if not there
 
     for exp in exps:
-        latents = exp.latents
-        batch, time, device = *latents.shape[:2], latents.device
+        payload = default(exp.latents, exp.video)
+        batch, time, device = *payload.shape[:2], payload.device
 
         if not exists(exp.lens):
             exp.lens = full((batch,), time, device = device)
@@ -158,11 +163,11 @@ def combine_experiences(
             exp.is_truncated = full((batch,), True, device = device)
 
         if isinstance(exp.is_from_world_model, bool):
-            exp.is_from_world_model = tensor(exp.is_from_world_model)
+            exp.is_from_world_model = full((batch,), exp.is_from_world_model, device = device, dtype = torch.bool)
 
     # convert to dictionary
 
-    exps_dict = [asdict(exp) for exp in exps]
+    exps_dict = [{f.name: getattr(exp, f.name) for f in fields(exp)} for exp in exps]
 
     values, tree_specs = zip(*[tree_flatten(exp_dict) for exp_dict in exps_dict])
 
@@ -209,6 +214,10 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def cast_to_tensor(t, device, dtype = None):
+    t = (t if is_tensor(t) else tensor(t)).to(device)
+    return t.to(dtype) if exists(dtype) else t
+
 def cosine_distance(x, y, mask = None):
     dist = 1. - F.cosine_similarity(x, y, dim = -1)
     return masked_mean(dist, mask)
@@ -238,6 +247,18 @@ def is_power_two(num):
     return log2(num).is_integer()
 
 # tensor helpers
+
+def z_score(t, mask = None, eps = 1e-5):
+    if not exists(mask):
+        return (t - t.mean()) / t.var(correction = 0).clamp(min = eps).sqrt()
+
+    mean = masked_mean(t, mask)
+    var = masked_mean((t - mean).pow(2), mask)
+    return (t - mean) / var.clamp(min = eps).sqrt()
+
+def flags_to_sequence(flags, positions, seq_len):
+    seq = arange(seq_len, device = flags.device)
+    return logical_and('b t, b -> b t', equal('t, b -> b t', seq, positions), flags)
 
 def straight_through(src, tgt):
     return tgt + src - src.detach()
@@ -654,7 +675,7 @@ class SymExpTwoHot(Module):
     def bins_to_scalar_value(
         self,
         logits, # (... l)
-        normalize = False
+        normalize = True
     ):
         two_hot_encoding = logits.softmax(dim = -1) if normalize else logits
         return einsum(two_hot_encoding, self.bin_values, '... l, l -> ...')
@@ -676,7 +697,7 @@ class SymExpTwoHot(Module):
         # fetch the closest two indices (two-hot encoding)
 
         left_indices = (indices - 1).clamp(min = 0)
-        right_indices = left_indices + 1
+        right_indices = (left_indices + 1).clamp(max = self.num_bins - 1)
 
         left_indices, right_indices = tuple(rearrange(t, '... -> ... 1') for t in (left_indices, right_indices))
 
@@ -1050,7 +1071,7 @@ class ActionEmbedder(Module):
 
         discrete_embeds = continuous_embeds = None
 
-        if exists(discrete_actions):
+        if exists(discrete_actions) and discrete_actions.shape[-1] > 0:
 
             discrete_action_types = default(discrete_action_types, self.default_discrete_action_types)
 
@@ -1065,7 +1086,7 @@ class ActionEmbedder(Module):
             discrete_actions_offsetted = add('... na, na', discrete_actions, offsets)
             discrete_embeds = self.discrete_action_embed(discrete_actions_offsetted)
 
-        if exists(continuous_actions):
+        if exists(continuous_actions) and continuous_actions.shape[-1] > 0:
             continuous_action_types = default(continuous_action_types, self.default_continuous_action_types)
 
             continuous_action_types = self.cast_action_types(continuous_action_types)
@@ -1108,6 +1129,7 @@ def calc_gae(
     rewards,
     values,
     masks = None,
+    learn_masks = None,
     gamma = 0.99,
     lam = 0.95,
     use_accelerated = None
@@ -1118,10 +1140,16 @@ def calc_gae(
     if not exists(masks):
         masks = torch.ones_like(values)
 
+    masks = masks.float()
+
     values = F.pad(values, (0, 1), value = 0.)
     values, values_next = values[..., :-1], values[..., 1:]
 
     delta = rewards + gamma * values_next * masks - values
+
+    if exists(learn_masks):
+        delta = delta.masked_fill(~learn_masks, 0.)
+
     gates = gamma * lam * masks
 
     scan = AssocScan(reverse = True, use_accelerated = use_accelerated)
@@ -1221,13 +1249,12 @@ def naive_attend(
     causal_block_size = 1,
     mask = None
 ):
+    groups = q.shape[1] // k.shape[1]
 
     if not exists(scale):
         scale = q.shape[-1] ** -0.5
 
     # grouped query attention
-
-    groups = q.shape[1] // k.shape[1]
 
     q = rearrange(q, 'b (h g) ... -> b h g ...', g = groups)
 
@@ -1629,15 +1656,15 @@ class GRULayer(Module):
 
         return x, hiddens
 
-# attention residual
-# https://arxiv.org/abs/2603.15031
+# attention pooling
 
-class AttentionResidual(Module):
+class AttentionPool(Module):
     def __init__(
         self,
         dim,
         heads = 4,
-        dim_head = 64
+        dim_head = 64,
+        **kwargs
     ):
         super().__init__()
         self.attn = Attention(
@@ -1646,7 +1673,9 @@ class AttentionResidual(Module):
             dim_head = dim_head,
             gate_values = False,
             value_residual = False,
-            rmsnorm_key = True
+            belief_attn = False,
+            rmsnorm_key = True,
+            **kwargs
         )
 
     def forward(
@@ -1655,7 +1684,7 @@ class AttentionResidual(Module):
         hiddens: list[Tensor] | None = None,
         **kwargs
     ):
-        assert exists(hiddens), 'hiddens must be passed to AttentionResidual'
+        assert exists(hiddens), 'hiddens must be passed to AttentionPool'
 
         context = stack(hiddens, dim = -2)
         queries = rearrange(x, '... d -> ... 1 d')
@@ -1663,6 +1692,7 @@ class AttentionResidual(Module):
         out = self.attn(queries, context = context)
 
         return rearrange(out, '... 1 d -> ... d')
+
 # axial space time transformer
 
 class AxialSpaceTimeTransformer(Module):
@@ -1681,8 +1711,9 @@ class AxialSpaceTimeTransformer(Module):
         special_attend_only_itself = False,  # this is set to True for the video tokenizer decoder (latents can only attend to itself while spatial modalities attend to the latents and everything)
         final_norm = True,
         value_residual = True,               # https://arxiv.org/abs/2410.17897 - but with learned mixing from OSS
-        rnn_time = True,
-        time_attention_use_pope = False
+        rnn_time = False,
+        time_attention_use_pope = False,
+        use_attn_pool = True
     ):
         super().__init__()
         assert depth >= time_block_every, f'depth must be at least {time_block_every}'
@@ -1751,20 +1782,14 @@ class AxialSpaceTimeTransformer(Module):
 
             rnn_layers.append(GRULayer(dim, dim) if is_time_block and rnn_time else None)
 
-            rnn_attn_residuals.append(AttentionResidual(dim, **attn_residual_kwargs) if is_time_block and rnn_time else None)
-            attn_attn_residuals.append(AttentionResidual(dim, **attn_residual_kwargs))
-            ff_attn_residuals.append(AttentionResidual(dim, **attn_residual_kwargs))
-
         self.layers = ModuleList(layers)
         self.rnn_layers = ModuleList(rnn_layers)
 
         self.is_time = is_time
 
-        self.rnn_attn_residuals = ModuleList(rnn_attn_residuals)
-        self.attn_attn_residuals = ModuleList(attn_attn_residuals)
-        self.ff_attn_residuals = ModuleList(ff_attn_residuals)
-
-        self.final_attn_residual = AttentionResidual(dim, **attn_residual_kwargs)
+        self.use_attn_pool = use_attn_pool
+        if use_attn_pool:
+            self.final_attn_pool = AttentionPool(dim, **attn_residual_kwargs)
 
         # final norm
 
@@ -1798,9 +1823,12 @@ class AxialSpaceTimeTransformer(Module):
 
         kv_cache = rnn_prev_hiddens = None
 
+        token_count = 0
+
         if exists(cache):
             kv_cache = cache.next_kv_cache
             rnn_prev_hiddens = cache.next_rnn_hiddens
+            token_count = cache.token_count
 
         # attend functions for space and time
 
@@ -1819,10 +1847,13 @@ class AxialSpaceTimeTransformer(Module):
         rnn_hiddens = []
 
         if has_kv_cache:
-            past_tokens, tokens = tokens[:, :-1], tokens[:, -1:]
+            if time > 1:
+                past_tokens, tokens = tokens[:, :-1], tokens[:, -1:]
+            else:
+                past_tokens = tokens[:, :0]
 
             rotary_seq_len = 1
-            rotary_pos_offset = past_tokens.shape[1]
+            rotary_pos_offset = token_count
         else:
             rotary_seq_len = time
             rotary_pos_offset = 0
@@ -1856,31 +1887,33 @@ class AxialSpaceTimeTransformer(Module):
         layer_hiddens = [tokens]
         hiddens = []
 
-        for (pre_attn_rearrange, post_attn_rearrange, attn, ff), maybe_rnn, layer_is_time, rnn_attn_res, attn_attn_res, ff_attn_res in zip(self.layers, self.rnn_layers, self.is_time, self.rnn_attn_residuals, self.attn_attn_residuals, self.ff_attn_residuals):
+        for (pre_attn_rearrange, post_attn_rearrange, attn, ff), maybe_rnn, layer_is_time in zip(self.layers, self.rnn_layers, self.is_time):
 
             # rnn block
 
             if layer_is_time and exists(maybe_rnn):
 
-                tokens = rnn_attn_res(tokens, layer_hiddens)
+                residual = tokens
 
                 tokens = pre_attn_rearrange(tokens)
 
                 tokens, inverse_pack_batch = pack_one(tokens, '* t d')
 
-                tokens, layer_rnn_hiddens = maybe_rnn(tokens, next(iter_rnn_prev_hiddens, None)) # todo, handle rnn cache
+                tokens_out, layer_rnn_hiddens = maybe_rnn(tokens, next(iter_rnn_prev_hiddens, None)) # todo, handle rnn cache
 
-                tokens = inverse_pack_batch(tokens)
+                tokens = inverse_pack_batch(tokens_out)
 
                 rnn_hiddens.append(layer_rnn_hiddens)
 
                 tokens = post_attn_rearrange(tokens)
 
+                tokens = tokens + residual
+
                 layer_hiddens.append(tokens)
 
             # attention block
 
-            tokens = attn_attn_res(tokens, layer_hiddens)
+            residual = tokens
 
             tokens = pre_attn_rearrange(tokens)
 
@@ -1900,7 +1933,7 @@ class AxialSpaceTimeTransformer(Module):
 
             # attention layer
 
-            tokens, attn_intermediates = attn(
+            tokens_out, attn_intermediates = attn(
                 tokens,
                 rotary_pos_emb = layer_rotary_pos_emb,
                 pope_pos_emb = layer_pope_pos_emb,
@@ -1910,7 +1943,9 @@ class AxialSpaceTimeTransformer(Module):
                 return_intermediates = True
             )
 
-            tokens = post_attn_rearrange(tokens)
+            tokens = post_attn_rearrange(tokens_out)
+
+            tokens = tokens + residual
 
             layer_hiddens.append(tokens)
 
@@ -1927,17 +1962,22 @@ class AxialSpaceTimeTransformer(Module):
 
             # feedforward block
 
-            tokens = ff_attn_res(tokens, layer_hiddens)
+            residual = tokens
 
             tokens = ff(tokens)
+
+            tokens = tokens + residual
 
             layer_hiddens.append(tokens)
 
             hiddens.append(tokens)
 
-        tokens = self.final_attn_residual(tokens, layer_hiddens)
-
         out = self.final_norm(tokens)
+
+        # apply attention pool post norm
+
+        if self.use_attn_pool:
+            out = self.final_attn_pool(out, layer_hiddens) + out
 
         if has_kv_cache:
             # just concat the past tokens back on for now, todo - clean up the logic
@@ -1951,7 +1991,8 @@ class AxialSpaceTimeTransformer(Module):
             safe_stack(normed_time_attn_inputs),
             safe_stack(normed_space_attn_inputs),
             safe_stack(rnn_hiddens),
-            hiddens
+            hiddens,
+            token_count + time
         )
 
         return out, intermediates
@@ -1982,15 +2023,27 @@ class CausalDepthwiseConv3d(Module):
 
     def forward(
         self,
-        x # (b, t, h, w, c)
+        x, # (b, t, h, w, c)
+        time_cache = None,
+        return_time_cache = False
     ):
+        causal_pad = self.causal_pad
+
         res = x
 
         x = self.norm(x)
         x = rearrange(x, 'b t h w c -> b c t h w')
 
-        # causal pad
-        x = pad_at_dim(x, (self.causal_pad, 0), dim = 2)
+        # handle cache or causal pad
+
+        if exists(time_cache):
+            x = torch.cat((time_cache, x), dim = 2)
+        else:
+            x = pad_at_dim(x, (causal_pad, 0), dim = 2)
+
+        next_time_cache = x[:, :, -causal_pad:]
+
+        # conv
 
         x = self.conv(x)
 
@@ -1999,7 +2052,11 @@ class CausalDepthwiseConv3d(Module):
         x = self.act(x)
         x = self.proj(x)
 
-        return x + res
+        out = x + res
+
+        if return_time_cache:
+            return out, next_time_cache
+        return out
 
 # video tokenizer
 
@@ -2030,17 +2087,21 @@ class VideoTokenizer(Module):
         time_decorr_loss_weight = 4e-3,
         space_decorr_loss_weight = 4e-3,
         decorr_sample_frac = 0.25,
-        use_loss_normalization = False,
+        use_loss_normalization = True,
         use_causal_conv3d = False,
+        use_time_rnn = False,
         causal_conv3d_kernel_size = 3,
         decoder_flow_steps = 1,
         decoder_v_space_loss = True,
         latent_receive_grad_frac: Callable | None = None,
+        latent_grad_only_at_noise = False,
         latent_ar_loss_weight = 0.,
         latent_ar_sigreg_loss_weight = 0.05,
         latent_ar_placement = 'encoder',
         latent_ar_sigreg_loss_kwargs = dict(num_slices = 256),
-        time_attention_use_pope = False
+        time_attention_use_pope = False,
+        decoder_flow_times_beta_alpha = 1.,
+        decoder_flow_times_beta_beta = 1.
     ):
         super().__init__()
 
@@ -2085,7 +2146,17 @@ class VideoTokenizer(Module):
 
         self.decoder_flow_steps = decoder_flow_steps
         self.decoder_v_space_loss = decoder_v_space_loss
+
+        if latent_grad_only_at_noise:
+            assert not exists(latent_receive_grad_frac), 'cannot set both latent_grad_only_at_noise and latent_receive_grad_frac'
+            latent_receive_grad_frac = lambda time_frac: (time_frac == 0.).float()
+
         self.latent_receive_grad_frac = latent_receive_grad_frac
+
+        self.decoder_times_beta_distribution = None
+        if decoder_flow_times_beta_alpha != 1. or decoder_flow_times_beta_beta != 1.:
+            self.decoder_times_beta_distribution = Beta(tensor(decoder_flow_times_beta_alpha), tensor(decoder_flow_times_beta_beta))
+
         self.has_flow = decoder_flow_steps > 1
 
         if self.has_flow:
@@ -2108,7 +2179,8 @@ class VideoTokenizer(Module):
             attn_kwargs = attn_kwargs,
             ff_kwargs = ff_kwargs,
             final_norm = True,
-            time_attention_use_pope = time_attention_use_pope
+            time_attention_use_pope = time_attention_use_pope,
+            rnn_time = use_time_rnn
         )
 
         # latents
@@ -2148,7 +2220,8 @@ class VideoTokenizer(Module):
             attn_kwargs = attn_kwargs,
             ff_kwargs = ff_kwargs,
             final_norm = True,
-            time_attention_use_pope = time_attention_use_pope
+            time_attention_use_pope = time_attention_use_pope,
+            rnn_time = use_time_rnn
         )
 
         # loss related
@@ -2341,7 +2414,10 @@ class VideoTokenizer(Module):
         return_latents = False,
         mask_patches = None,
         return_intermediates = False,
-        update_loss_ema = None
+        update_loss_ema = None,
+        time_cache = None,
+        return_time_cache = False,
+        time_lens = None
     ):
 
         # handle image pretraining
@@ -2360,12 +2436,22 @@ class VideoTokenizer(Module):
 
         assert divisible_by(height, patch_size) and divisible_by(width, patch_size)
 
+        # time cache setup
+
+        if not exists(time_cache):
+            time_cache = (None,) * 3
+
+        pre_causal_conv_cache, transformer_cache, post_causal_conv_cache = time_cache
+        causal_conv_kwargs = dict(return_time_cache = True)
+
         # to tokens
 
         tokens = self.patch_to_tokens(video)
 
+        next_pre_causal_conv_cache = None
+
         if self.use_causal_conv3d:
-            tokens = self.encoder_pre_causal_conv3d(tokens)
+            tokens, next_pre_causal_conv_cache = self.encoder_pre_causal_conv3d(tokens, time_cache = pre_causal_conv_cache, **causal_conv_kwargs)
 
         # get some dimensions
 
@@ -2397,7 +2483,11 @@ class VideoTokenizer(Module):
 
         # encoder attention
 
-        tokens, (_, time_attn_normed_inputs, space_attn_normed_inputs, *_) = self.encoder_transformer(tokens, return_intermediates = True)
+        tokens, intermediates = self.encoder_transformer(tokens, cache = transformer_cache, return_intermediates = True)
+        _, time_attn_normed_inputs, space_attn_normed_inputs, *_ = intermediates
+        next_transformer_cache = intermediates
+
+        next_post_causal_conv_cache = None
 
         if self.use_causal_conv3d:
             b, t, *_ = tokens.shape
@@ -2405,7 +2495,7 @@ class VideoTokenizer(Module):
             spatial_tokens, latent_tokens = unpack(tokens, packed_latent_shape, 'b t * d')
             spatial_tokens = inverse_pack_space(spatial_tokens)
 
-            spatial_tokens = self.encoder_post_causal_conv3d(spatial_tokens)
+            spatial_tokens, next_post_causal_conv_cache = self.encoder_post_causal_conv3d(spatial_tokens, time_cache = post_causal_conv_cache, **causal_conv_kwargs)
 
             spatial_tokens, _ = pack_one(spatial_tokens, 'b t * d')
             tokens, _ = pack((spatial_tokens, latent_tokens), 'b t * d')
@@ -2422,14 +2512,22 @@ class VideoTokenizer(Module):
         latents = self.encoded_to_latents(latents)
 
         if return_latents:
-            return latents
+            next_time_cache = (next_pre_causal_conv_cache, next_transformer_cache, next_post_causal_conv_cache)
+
+            if not return_time_cache:
+                return latents
+            return latents, next_time_cache
 
         if self.has_latent_ar and self.latent_ar_in_decoder:
             latent_ar_loss, latent_ar_sigreg_loss, _ = self.latent_ar(latents)
 
         if self.has_flow:
 
-            time_indices = torch.randint(0, self.decoder_flow_steps, (batch,), device = device)
+            if exists(self.decoder_times_beta_distribution):
+                u = self.decoder_times_beta_distribution.sample((batch,)).to(device)
+                time_indices = (u * self.decoder_flow_steps).clamp(0, self.decoder_flow_steps - 1).long()
+            else:
+                time_indices = torch.randint(0, self.decoder_flow_steps, (batch,), device = device)
 
             noise = torch.randn_like(video)
 
@@ -2462,7 +2560,17 @@ class VideoTokenizer(Module):
 
         # mse loss
 
-        recon_loss = F.mse_loss(pred, target)
+        if exists(time_lens):
+            if not is_tensor(time_lens):
+                time_lens = tensor(time_lens, device = device, dtype = torch.long)
+
+            recon_loss = F.mse_loss(pred, target, reduction = 'none')
+
+            mask = lens_to_mask(time_lens, time)
+            mask = rearrange(mask, 'b t -> b 1 t 1 1')
+            recon_loss = masked_mean(recon_loss, mask)
+        else:
+            recon_loss = F.mse_loss(pred, target)
 
         # losses
 
@@ -2589,6 +2697,9 @@ class DynamicsWorldModel(Module):
         num_tasks = 0,
         num_video_views = 1,
         dim_proprio = None,
+        dim_state = None,
+        dim_critic_state = None,
+        critic_state_embedder: Module | None = None,
         reward_encoder_kwargs: dict = dict(),
         depth = 4,
         pred_orig_latent = True,   # directly predicting the original x0 data yield better results, rather than velocity (x-space vs v-space)
@@ -2599,7 +2710,7 @@ class DynamicsWorldModel(Module):
         attn_dim_head = 64,
         attn_softclamp_value = 50.,
         ff_kwargs: dict = dict(),
-        use_time_rnn = True,
+        use_time_rnn = False,
         loss_weight_fn: Callable = ramp_weight,
         prob_shortcut_train = None,                  # probability of shortcut training, defaults to 1 - 1 / num_step_sizes
         add_reward_embed_to_agent_token = False,
@@ -2619,6 +2730,9 @@ class DynamicsWorldModel(Module):
         latent_flow_loss_weight = 1.,
         shortcut_loss_weight = 1.,
         reward_loss_weight: float | list[float] = 1.,
+        predict_terminals: bool = True,
+        predict_terminal_mlp_kwargs: dict = dict(depth = 1),
+        terminal_loss_weight: float = 1.,
         discrete_action_loss_weight: float | list[float] = 1.,
         continuous_action_loss_weight: float | list[float] = 1.,
         num_latent_genes = 0,                       # for carrying out evolution within the dreams https://web3.arxiv.org/abs/2503.19037
@@ -2635,7 +2749,10 @@ class DynamicsWorldModel(Module):
         delight_temperature = 1.,
         normalize_advantages = None,
         value_clip = 0.4,
+        clip_values = False,
         policy_entropy_weight = .01,
+        agent_policy_gradient_frac = 1.,
+        agent_value_gradient_frac = 1.,
         gae_use_accelerated = False,
         use_loss_normalization = False,
         time_attention_use_pope = False,
@@ -2738,6 +2855,27 @@ class DynamicsWorldModel(Module):
 
         self.has_proprio = exists(dim_proprio)
         self.dim_proprio = dim_proprio
+
+        # state
+
+        self.dim_state = dim_state
+
+        if exists(dim_state):
+            self.state_to_latents = Sequential(
+                LinearNoBias(dim_state, num_latent_tokens * dim_latent),
+                Rearrange('... (n d) -> ... n d', n = num_latent_tokens, d = dim_latent)
+            )
+        else:
+            self.state_to_latents = None
+
+        # asymmetric critic state embedding
+
+        if exists(critic_state_embedder):
+            self.critic_state_embedder = critic_state_embedder
+        elif exists(dim_critic_state):
+            self.critic_state_embedder = nn.Linear(dim_critic_state, dim)
+        else:
+            self.critic_state_embedder = None
 
         if self.has_proprio:
             self.to_proprio_token = nn.Linear(dim_proprio, dim)
@@ -2900,6 +3038,21 @@ class DynamicsWorldModel(Module):
             multi_token_pred_len
         )
 
+        # terminal prediction
+
+        self.predict_terminals = predict_terminals
+
+        if predict_terminals:
+            self.to_state_terminal_pred = Sequential(
+                create_mlp(
+                    dim_in = dim_latent,
+                    dim = dim_latent * 4,
+                    dim_out = 1,
+                    **predict_terminal_mlp_kwargs
+                ),
+                Rearrange('... 1 -> ...')
+            )
+
         # value head
 
         self.value_head = create_mlp(
@@ -2935,7 +3088,11 @@ class DynamicsWorldModel(Module):
 
         self.ppo_eps_clip = ppo_eps_clip
         self.value_clip = value_clip
+        self.clip_values = clip_values
         self.policy_entropy_weight = policy_entropy_weight
+
+        self.agent_policy_gradient_frac = agent_policy_gradient_frac
+        self.agent_value_gradient_frac = agent_value_gradient_frac
 
         # pmpo related
 
@@ -2963,6 +3120,7 @@ class DynamicsWorldModel(Module):
         self.flow_loss_normalizer = LossNormalizer() if use_loss_normalization else None
         self.shortcut_flow_loss_normalizer = LossNormalizer() if use_loss_normalization else None
         self.reward_loss_normalizer = LossNormalizer(multi_token_pred_len) if use_loss_normalization else None
+        self.state_terminal_loss_normalizer = LossNormalizer() if (use_loss_normalization and self.predict_terminals) else None
         self.discrete_actions_loss_normalizer = LossNormalizer(multi_token_pred_len) if (exists(num_discrete_actions) and use_loss_normalization) else None
         self.continuous_actions_loss_normalizer = LossNormalizer(multi_token_pred_len) if (exists(num_continuous_actions) and use_loss_normalization) else None
 
@@ -2970,6 +3128,7 @@ class DynamicsWorldModel(Module):
         self.shortcut_loss_weight = shortcut_loss_weight
 
         self.register_buffer('reward_loss_weight', tensor(reward_loss_weight))
+        self.register_buffer('terminal_loss_weight', tensor(terminal_loss_weight))
         self.register_buffer('discrete_action_loss_weight', tensor(discrete_action_loss_weight))
         self.register_buffer('continuous_action_loss_weight', tensor(continuous_action_loss_weight))
 
@@ -2997,8 +3156,8 @@ class DynamicsWorldModel(Module):
     def value_head_parameters(self):
         return self.value_head.parameters()
 
-    def parameter(self):
-        params = super().parameters()
+    def parameters(self, *args, **kwargs):
+        params = super().parameters(*args, **kwargs)
 
         if not exists(self.video_tokenizer):
             return params
@@ -3106,35 +3265,54 @@ class DynamicsWorldModel(Module):
         use_time_cache = True,
         store_agent_embed = True,
         store_old_action_unembeds = True,
+        obs_to_latents_fn = None
     ):
-        assert exists(self.video_tokenizer)
+        device = self.device
 
-        init_obs = env.reset()
+        reset_kwargs = dict(seed = seed) if exists(seed) else dict()
+        init_obs = env.reset(**reset_kwargs)
 
-        # if we are not a observation dict, we must be a raw image tensor
+        if isinstance(init_obs, tuple):
+            init_obs = init_obs[0]
 
         if not isinstance(init_obs, dict):
-            assert isinstance(init_obs, torch.Tensor)
-            init_obs = {"image": init_obs}
+            if not is_tensor(init_obs):
+                init_obs = cast_to_tensor(init_obs, device, dtype = torch.float32)
+            if init_obs.ndim >= 3:
+                init_obs = dict(image = init_obs)
+            else:
+                init_obs = dict(state = init_obs)
 
-        assert 'image' in init_obs
-        if self.has_proprio:
-            assert 'proprio' in init_obs
+        assert 'image' in init_obs or 'state' in init_obs
+        assert not self.has_proprio or 'proprio' in init_obs
 
-        proprio = init_obs.get('proprio')
-
-        # setup accumulation of frames to video and proprio
+        proprio = init_obs.get('proprio', None)
 
         if env_is_vectorized:
-            video = rearrange(init_obs['image'], 'b c vh vw -> b c 1 vh vw')
-            accumulated_proprio = maybe(rearrange)(proprio, 'b d -> b 1 d')
+            image_frame = rearrange(cast_to_tensor(init_obs['image'], device), 'b c vh vw -> b c 1 vh vw') if 'image' in init_obs else None
+            accumulated_proprio = maybe(rearrange)(init_obs.get('proprio', None), 'b d -> b 1 d')
+            state_frame = init_obs.get('state', None)
+            if exists(state_frame):
+                state_frame = cast_to_tensor(state_frame, device, dtype = torch.float32)
         else:
-            video = rearrange(init_obs['image'], 'c vh vw -> 1 c 1 vh vw')
-            accumulated_proprio = maybe(rearrange)(proprio, 'd -> 1 1 d')
+            image_frame = rearrange(cast_to_tensor(init_obs['image'], device), 'c vh vw -> 1 c 1 vh vw') if 'image' in init_obs else None
+            accumulated_proprio = maybe(rearrange)(init_obs.get('proprio', None), 'd -> 1 1 d')
+            state_frame = init_obs.get('state', None)
+            if exists(state_frame):
+                state_frame = rearrange(cast_to_tensor(state_frame, device, dtype = torch.float32), 'd -> 1 d')
 
-        batch, device = video.shape[0], video.device
+        batch = image_frame.shape[0] if exists(image_frame) else state_frame.shape[0]
 
-        # accumulate
+        video_frames = []
+        if exists(image_frame):
+            video_frames.append(image_frame)
+
+        states = []
+        if exists(state_frame):
+            states.append(state_frame)
+
+        if exists(accumulated_proprio):
+            accumulated_proprio = cast_to_tensor(accumulated_proprio, device, dtype = torch.float32)
 
         rewards = None
         discrete_actions = None
@@ -3142,81 +3320,93 @@ class DynamicsWorldModel(Module):
         discrete_log_probs = None
         continuous_log_probs = None
         values = None
-        latents = None
-
+        
+        acc_latents = None
         acc_agent_embed = None
         acc_policy_embed = None
 
-        # keep track of termination, for setting the `is_truncated` field on Experience and for early stopping interaction with env
-
         is_terminated = full((batch,), False, device = device)
         is_truncated = full((batch,), False, device = device)
+        was_terminated = full((batch,), False, device = device)
+        done_flag = full((batch,), False, device = device)
 
         episode_lens = full((batch,), 0, device = device)
-
-        # derive step size
 
         assert divisible_by(self.max_steps, num_steps)
         step_size = self.max_steps // num_steps
 
-        # maybe time kv cache
-
         time_cache = None
+        tokenizer_time_cache = None
 
         step_index = 0
+        
+        obs = init_obs
+        curr_image = image_frame
+        curr_state = state_frame
 
-        while not is_terminated.all():
+        while not done_flag.all():
             step_index += 1
 
-            latents = self.video_tokenizer(video, return_latents = True)
+            if exists(obs_to_latents_fn):
+                latents, next_tokenizer_time_cache = obs_to_latents_fn(self, obs, tokenizer_time_cache)
+            elif exists(curr_image):
+                assert exists(self.video_tokenizer), 'video_tokenizer must be defined to automatically parse image observations'
+                latents, next_tokenizer_time_cache = self.video_tokenizer(curr_image, return_latents = True, time_cache = tokenizer_time_cache, return_time_cache = True)
+            elif exists(curr_state):
+                assert exists(self.state_to_latents), 'DynamicsWorldModel must have dim_state defined to automatically parse state observations'
+                latents = self.state_to_latents(curr_state)
+                latents = rearrange(latents, 'b n d -> b 1 n d') if latents.ndim == 3 else latents
+                next_tokenizer_time_cache = tokenizer_time_cache
+            else:
+                raise ValueError('Observations must contain an image or state key, or provide a custom obs_to_latents_fn')
+
+            tokenizer_time_cache = next_tokenizer_time_cache
+            acc_latents = safe_cat((acc_latents, latents), dim=1)
+
+            past_discrete_actions = discrete_actions[:, -1:] if exists(discrete_actions) else None
+            past_continuous_actions = continuous_actions[:, -1:] if exists(continuous_actions) else None
+            past_proprio = accumulated_proprio[:, -1:] if exists(accumulated_proprio) else None
+            past_rewards = rewards[:, -1:] if exists(rewards) else None
 
             _, (embeds, next_time_cache) = self.forward(
                 latents = latents,
                 signal_levels = self.max_steps - 1,
                 step_sizes = step_size,
-                rewards = rewards,
-                discrete_actions = discrete_actions,
-                continuous_actions = continuous_actions,
-                proprio=accumulated_proprio,
+                rewards = past_rewards,
+                discrete_actions = past_discrete_actions,
+                continuous_actions = past_continuous_actions,
+                proprio = past_proprio,
                 time_cache = time_cache,
                 latent_is_noised = True,
                 return_pred_only = True,
                 return_intermediates = True
             )
 
-            # time kv cache
-
             if use_time_cache:
                 time_cache = next_time_cache
 
-            # get one agent
-
             agent_embed = embeds.agent
-
             one_agent_embed = agent_embed[..., -1:, agent_index, :]
 
-            # values
+            value_embed = one_agent_embed
 
-            value_bins = self.value_head(one_agent_embed)
+            if exists(self.critic_state_embedder) and exists(state_frame):
+                critic_embed = self.critic_state_embedder(state_frame.to(device))
+                value_embed = value_embed + rearrange(critic_embed, 'batch dim -> batch 1 dim')
+
+            value_bins = self.value_head(value_embed)
             value = self.reward_encoder.bins_to_scalar_value(value_bins)
-
             values = safe_cat((values, value), dim = 1)
-
-            # policy embed
 
             policy_embed = self.policy_head(one_agent_embed)
 
             if store_old_action_unembeds:
                 acc_policy_embed = safe_cat((acc_policy_embed, policy_embed), dim = 1)
 
-            # sample actions
-
             sampled_discrete_actions, sampled_continuous_actions = self.action_embedder.sample(policy_embed, pred_head_index = 0, squeeze = True)
 
             discrete_actions = safe_cat((discrete_actions, sampled_discrete_actions), dim = 1)
             continuous_actions = safe_cat((continuous_actions, sampled_continuous_actions), dim = 1)
-
-            # get the log prob and values for policy optimization
 
             one_discrete_log_probs, one_continuous_log_probs = self.action_embedder.log_probs(
                 policy_embed,
@@ -3228,110 +3418,170 @@ class DynamicsWorldModel(Module):
             discrete_log_probs = safe_cat((discrete_log_probs, one_discrete_log_probs), dim = 1)
             continuous_log_probs = safe_cat((continuous_log_probs, one_continuous_log_probs), dim = 1)
 
-            # pass the sampled action to the environment and get back next state and reward
+            if env_is_vectorized:
+                if not exists(sampled_continuous_actions):
+                    action_out = sampled_discrete_actions.cpu().numpy().reshape(-1)
+                else:
+                    action_out = (sampled_discrete_actions.cpu().numpy(), sampled_continuous_actions.cpu().numpy())
+            else:
+                action_out = int(sampled_discrete_actions.item()) if sampled_discrete_actions.shape[-1] == 1 else (sampled_discrete_actions, sampled_continuous_actions)
 
-            env_step_out = env.step((sampled_discrete_actions, sampled_continuous_actions))
+            env_step_out = env.step(action_out)
 
             if len(env_step_out) == 2:
-                obs, reward = env_step_out
-                terminated = full((batch,), False)
-                truncated = full((batch,), False)
-
+                next_obs, reward = env_step_out
+                terminated = full((batch,), False, device = device)
+                truncated = full((batch,), False, device = device)
             elif len(env_step_out) == 3:
-                obs, reward, terminated = env_step_out
-                truncated = full((batch,), False)
-
+                next_obs, reward, terminated = env_step_out
+                truncated = full((batch,), False, device = device)
             elif len(env_step_out) == 4:
-                obs, reward, terminated, truncated = env_step_out
-
+                next_obs, reward, terminated, truncated = env_step_out
             elif len(env_step_out) == 5:
-                obs, reward, terminated, truncated, info = env_step_out
+                next_obs, reward, terminated, truncated, info = env_step_out
+            
+            terminated = cast_to_tensor(terminated, device).view((batch,))
+            truncated = cast_to_tensor(truncated, device).view((batch,))
+            reward = cast_to_tensor(reward, device, dtype = torch.float32)
 
-            # if we are not a observation dict, we must be a raw image tensor
+            if not isinstance(next_obs, dict):
+                if not is_tensor(next_obs):
+                    next_obs = cast_to_tensor(next_obs, device, dtype=torch.float32)
+                if next_obs.ndim >= 3:
+                    next_obs = dict(image = next_obs)
+                else:
+                    next_obs = dict(state = next_obs)
 
-            if not isinstance(obs, dict):
-                assert isinstance(obs, torch.Tensor)
-                obs = {"image": obs}
+            assert 'image' in next_obs or 'state' in next_obs
+            
+            episode_lens = torch.where(done_flag, episode_lens, episode_lens + 1)
 
-            assert 'image' in obs
-            if self.has_proprio:
-                assert 'proprio' in obs
-
-            # maybe add state entropy bonus
-
-            if self.add_state_entropy_bonus:
-                state_pred_token = embeds.state_pred
-
-                state_pred = self.to_state_pred(state_pred_token)
-
-                dist = self.state_beta_dist(state_pred)
-
-                state_entropy = dist.entropy().sum()
-
-                reward = reward + state_entropy * self.state_entropy_bonus_weight
-
-            # update episode lens
-
-            episode_lens = torch.where(is_terminated, episode_lens, episode_lens + 1)
-
-            # update `is_terminated`
-
-            # (1) - environment says it is terminated
-            # (2) - previous step is truncated (this step is for bootstrap value)
-
-            is_terminated |= (terminated | is_truncated)
-
-            # update `is_truncated`
-
-            if step_index <= max_timesteps:
-                is_truncated |= truncated
-
-            if step_index == max_timesteps:
-                # if the step index is at the max time step allowed, set the truncated flag, if not already terminated
-
+            is_terminated |= terminated
+            is_truncated |= truncated
+            if step_index >= max_timesteps:
                 is_truncated |= ~is_terminated
 
-            proprio = obs.get('proprio')
-
-            # batch and time dimension
-
-            if env_is_vectorized:
-                next_frame = rearrange(obs['image'], 'b c vh vw -> b c 1 vh vw')
-                proprio = maybe(rearrange)(proprio, 'b d -> b 1 d')
-                reward = rearrange(reward, 'b -> b 1')
-            else:
-                next_frame = rearrange(obs['image'], 'c vh vw -> 1 c 1 vh vw')
-                proprio = maybe(rearrange)(proprio, 'd -> 1 1 d')
-                reward = rearrange(reward, ' -> 1 1')
-
-            # concat
-
-            video = cat((video, next_frame), dim = 2)
+            was_terminated |= terminated
+            done_flag |= (is_terminated | is_truncated)
+            
+            reward = rearrange(reward, 'b -> b 1') if env_is_vectorized else rearrange(reward, ' -> 1 1')
             rewards = safe_cat((rewards, reward), dim = 1)
-
-            accumulated_proprio = safe_cat((accumulated_proprio, proprio), dim=1)
 
             acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
 
-        # package up one experience for learning
+            obs = next_obs
+            next_proprio = obs.get('proprio', None)
+            
+            # handle fetching new states and images
 
-        batch, device = latents.shape[0], latents.device
+            curr_state = None
+
+            if env_is_vectorized:
+                curr_image = rearrange(cast_to_tensor(obs['image'], device), 'b c vh vw -> b c 1 vh vw') if 'image' in obs else None
+
+                if 'state' in obs:
+                    curr_state = cast_to_tensor(obs['state'], device, dtype = torch.float32)
+
+                next_proprio = maybe(rearrange)(next_proprio, 'b d -> b 1 d')
+            else:
+                curr_image = rearrange(cast_to_tensor(obs['image'], device), 'c vh vw -> 1 c 1 vh vw') if 'image' in obs else None
+
+                if 'state' in obs:
+                    curr_state = rearrange(cast_to_tensor(obs['state'], device, dtype = torch.float32), 'd -> 1 d')
+
+                next_proprio = maybe(rearrange)(next_proprio, 'd -> 1 1 d')
+
+            if exists(next_proprio):
+                next_proprio = cast_to_tensor(next_proprio, device, dtype = torch.float32)
+                accumulated_proprio = safe_cat((accumulated_proprio, next_proprio), dim=1)
+
+            if exists(curr_state):
+                state_frame = curr_state
+
+            if exists(state_frame):
+                if not is_tensor(state_frame):
+                    state_frame = tensor(state_frame, dtype = torch.float32, device = device)
+                else:
+                    state_frame = state_frame.to(device)
+
+                states.append(state_frame)
+
+            if exists(curr_image):
+                curr_image = curr_image.to(device)
+                video_frames.append(curr_image)
+
+            need_bootstrap = is_truncated & ~was_terminated
+
+            if done_flag.all() and need_bootstrap.any():
+                if exists(obs_to_latents_fn):
+                    bootstrap_latents, _ = obs_to_latents_fn(obs, tokenizer_time_cache)
+                else:
+                    bootstrap_latents, _ = self.video_tokenizer(curr_image, return_latents = True, time_cache = tokenizer_time_cache, return_time_cache = True)
+                
+                _, (embeds, _) = self.forward(
+                    latents = bootstrap_latents,
+                    signal_levels = self.max_steps - 1,
+                    step_sizes = step_size,
+                    rewards = rewards[:, -1:] if exists(rewards) else None,
+                    discrete_actions = discrete_actions[:, -1:] if exists(discrete_actions) else None,
+                    continuous_actions = continuous_actions[:, -1:] if exists(continuous_actions) else None,
+                    proprio = accumulated_proprio[:, -1:] if exists(accumulated_proprio) else None,
+                    time_cache = time_cache,
+                    latent_is_noised = True,
+                    return_pred_only = True,
+                    return_intermediates = True
+                )
+                
+                one_agent_embed = embeds.agent[..., -1:, agent_index, :]
+                
+                value_embed = one_agent_embed
+
+                if exists(self.critic_state_embedder) and exists(state_frame):
+                    critic_embed = self.critic_state_embedder(state_frame.to(device))
+                    value_embed = value_embed + rearrange(critic_embed, 'batch dim -> batch 1 dim')
+
+                value_bins = self.value_head(value_embed)
+                bootstrap_value = self.reward_encoder.bins_to_scalar_value(value_bins)
+
+                values = torch.cat((values, bootstrap_value), dim = 1)
+                rewards = torch.cat((rewards, torch.zeros_like(rewards[:, -1:])), dim = 1)
+
+                if exists(discrete_actions):
+                    discrete_actions = torch.cat((discrete_actions, torch.zeros_like(discrete_actions[:, -1:])), dim = 1) # dummy action
+                    discrete_log_probs = torch.cat((discrete_log_probs, discrete_log_probs[:, -1:] * 0), dim = 1)
+
+                acc_latents = safe_cat((acc_latents, acc_latents[:, -1:]), dim = 1)
+
+                episode_lens = torch.where(need_bootstrap, episode_lens + 1, episode_lens)
+                break
+
+        video = cat(video_frames, dim=2) if len(video_frames) > 0 else None
+        stacked_states = stack(states, dim=1) if len(states) > 0 else None
+
+        # calculate episode return
+
+        time_dim = rewards.shape[-1]
+        step_mask = lens_to_mask(episode_lens, time_dim)
+        episode_return = rewards.masked_fill(~step_mask, 0.).sum(dim = -1)
 
         one_experience = Experience(
-            latents = latents,
-            video = video[:, :, :-1],
+            latents = acc_latents,
+            video = video[:, :, :-1] if exists(video) else None,
+            critic_state = stacked_states[:, :-1] if exists(stacked_states) else None,
             rewards = rewards,
-            proprio=accumulated_proprio[:, :-1] if exists(accumulated_proprio) else None,
-            actions = (discrete_actions, continuous_actions),
-            log_probs = (discrete_log_probs, continuous_log_probs),
+            proprio = accumulated_proprio[:, :-1] if exists(accumulated_proprio) else None,
+            actions = Actions(discrete_actions, continuous_actions),
+            log_probs = Actions(discrete_log_probs, continuous_log_probs),
             values = values,
             old_action_unembeds = self.action_embedder.unembed(acc_policy_embed, pred_head_index = 0) if exists(acc_policy_embed) and store_old_action_unembeds else None,
             agent_embed = acc_agent_embed if store_agent_embed else None,
             step_size = step_size,
             agent_index = agent_index,
             is_truncated = is_truncated,
+            terminals = was_terminated,
             lens = episode_lens,
-            is_from_world_model = False
+            is_from_world_model = False,
+            episode_return = episode_return
         )
 
         return one_experience
@@ -3358,8 +3608,13 @@ class DynamicsWorldModel(Module):
         experience = experience.to(self.device)
 
         latents = experience.latents
+        if not exists(latents):
+            assert exists(self.video_tokenizer) and exists(experience.video)
+            latents = self.video_tokenizer(experience.video, return_latents = True)
+
         actions = experience.actions
         proprio = experience.proprio
+        critic_state = experience.critic_state
         old_log_probs = experience.log_probs
         old_values = experience.values
         rewards = experience.rewards
@@ -3386,20 +3641,34 @@ class DynamicsWorldModel(Module):
             rewards = rewards.masked_fill(~mask_for_gae, 0.)
             old_values = old_values.masked_fill(~mask_for_gae, 0.)
 
+        lens = default(experience.lens, full((batch,), time, device = self.device))
+
+        learnable_lens = lens - experience.is_truncated.long()
+        mask = lens_to_mask(learnable_lens, time)
+
+        # build continuation masks for gae from predicted terminals
+
+        gae_masks = lens_to_mask((lens - 1).clamp(min = 0), time)
+
+        if exists(experience.terminals):
+            terminals = experience.terminals
+
+            if terminals.ndim == 1:
+                terminals = flags_to_sequence(terminals, (lens - 1).clamp(min = 0), time)
+
+            gae_masks.masked_fill_(terminals.bool(), 0.)
+
         # calculate returns
 
-        returns = calc_gae(rewards, old_values, gamma = self.gae_discount_factor, lam = self.gae_lambda, use_accelerated = self.gae_use_accelerated)
-
-        # handle variable lengths
-
-        max_time = latents.shape[1]
-        is_var_len = exists(experience.lens)
-
-        mask = None
-
-        if is_var_len:
-            learnable_lens = experience.lens - experience.is_truncated.long() # if is truncated, remove the last one, as it is bootstrapped value
-            mask = lens_to_mask(learnable_lens, max_time)
+        returns = calc_gae(
+            rewards,
+            old_values,
+            masks = gae_masks,
+            learn_masks = mask,
+            gamma = self.gae_discount_factor,
+            lam = self.gae_lambda,
+            use_accelerated = self.gae_use_accelerated
+        )
 
         # determine whether to finetune entire transformer or just learn the heads
 
@@ -3414,12 +3683,14 @@ class DynamicsWorldModel(Module):
 
             # quantile filter
 
-            lo, hi = torch.quantile(returns, self.reward_quantile_filter).tolist()
-            returns_for_stats = returns.clamp(lo, hi)
+            returns_for_stats = returns[mask] if exists(mask) else returns
+
+            lo, hi = torch.quantile(returns_for_stats, self.reward_quantile_filter).tolist()
+            returns_for_stats = returns_for_stats.clamp(lo, hi)
 
             # mean, var - todo - handle distributed
 
-            returns_mean, returns_var = returns_for_stats.mean(), returns_for_stats.var()
+            returns_mean, returns_var = returns_for_stats.mean(), returns_for_stats.var(correction = 0)
 
             # ema
 
@@ -3442,7 +3713,7 @@ class DynamicsWorldModel(Module):
         normalize_advantages = default(normalize_advantages, not use_pmpo)
 
         if normalize_advantages:
-            advantage = F.layer_norm(advantage, advantage.shape, eps = eps)
+            advantage = z_score(advantage, mask = mask, eps = eps)
 
         # https://arxiv.org/abs/2410.04166v1
 
@@ -3468,7 +3739,7 @@ class DynamicsWorldModel(Module):
                     rewards = rewards,
                     discrete_actions = discrete_actions,
                     continuous_actions = continuous_actions,
-                    proprio=proprio,
+                    proprio = proprio,
                     latent_is_noised = True,
                     return_pred_only = True,
                     return_intermediates = True
@@ -3483,17 +3754,39 @@ class DynamicsWorldModel(Module):
 
         # ppo
 
-        policy_embed = self.policy_head(agent_embeds)
+        policy_agent_embeds = frac_gradient(agent_embeds, self.agent_policy_gradient_frac)
+        policy_embed = self.policy_head(policy_agent_embeds)
+        
+        # align actions with policy embed if latents had a bootstrap state appended
+        
+        if exists(discrete_actions) and discrete_actions.shape[1] == latents.shape[1] and discrete_actions.shape[1] == policy_embed.shape[1] + 1:
+            discrete_actions = discrete_actions[:, :-1]
+            if exists(continuous_actions):
+                continuous_actions = continuous_actions[:, :-1]
 
         log_probs, entropies = self.action_embedder.log_probs(policy_embed, pred_head_index = 0, discrete_targets = discrete_actions, continuous_targets = continuous_actions, return_entropies = True)
 
         # concat discrete and continuous actions into one for optimizing
+
+        if exists(old_log_probs) and old_log_probs.discrete.shape[1] == policy_embed.shape[1] + 1:
+            old_log_probs = Actions(
+                old_log_probs.discrete[:, :-1] if exists(old_log_probs.discrete) else None,
+                old_log_probs.continuous[:, :-1] if exists(old_log_probs.continuous) else None
+            )
 
         old_log_probs = safe_cat(old_log_probs, dim = -1)
         log_probs = safe_cat(log_probs, dim = -1)
         entropies = safe_cat(entropies, dim = -1)
 
         advantage = rearrange(advantage, '... -> ... 1') # broadcast across all actions
+
+        # align advantage to log_probs length if bootstrap padded
+
+        if advantage.shape[1] == log_probs.shape[1] + 1:
+            advantage = advantage[:, :-1]
+            mask = mask[:, :-1] if exists(mask) else None
+            pos_advantage_mask = pos_advantage_mask[:, :-1] if exists(pos_advantage_mask) else None
+            neg_advantage_mask = neg_advantage_mask[:, :-1] if exists(neg_advantage_mask) else None
 
         # calculate delight
         # Ian Osband - https://arxiv.org/abs/2603.14608v1
@@ -3534,7 +3827,7 @@ class DynamicsWorldModel(Module):
             if neg.any():
                 neg_loss = scaled_action_log_probs[neg].sum()
 
-            num_advantages = max(1, len(advantage))
+            num_advantages = max(1., mask.sum().item() if exists(mask) else advantage.numel())
 
             α = self.pmpo_pos_to_neg_weight
             policy_loss = -α * (pos_loss - neg_loss) / num_advantages
@@ -3606,31 +3899,51 @@ class DynamicsWorldModel(Module):
 
         # value loss
 
-        value_bins = self.value_head(agent_embeds)
+        value_agent_embeds = frac_gradient(agent_embeds, self.agent_value_gradient_frac)
+
+        # maybe critic asymmetric state
+
+        if exists(self.critic_state_embedder) and exists(critic_state):
+            critic_embeds = self.critic_state_embedder(critic_state)
+
+            if critic_embeds.ndim == 3 and value_agent_embeds.ndim == 4:
+                critic_embeds = rearrange(critic_embeds, 'b t d -> b t 1 d')
+
+            value_agent_embeds = value_agent_embeds + critic_embeds
+
+        # value head prediction
+
+        value_bins = self.value_head(value_agent_embeds)
         values = self.reward_encoder.bins_to_scalar_value(value_bins)
 
-        clipped_values = old_values + (values - old_values).clamp(-self.value_clip, self.value_clip)
-        clipped_value_bins = self.reward_encoder(clipped_values)
+        # align returns and old_values to value_bins length if bootstrap padded
+        if returns.shape[1] == value_bins.shape[1] + 1:
+            returns = returns[:, :-1]
+            old_values = old_values[:, :-1]
 
         return_bins = self.reward_encoder(returns)
 
-        value_bins, return_bins, clipped_value_bins = tuple(rearrange(t, 'b t l -> b l t') for t in (value_bins, return_bins, clipped_value_bins))
+        value_bins, return_bins = tuple(rearrange(t, 'b t l -> b l t') for t in (value_bins, return_bins))
 
-        value_loss_1 = -(return_bins * value_bins.log_softmax(dim = 1)).sum(dim = 1)
-        value_loss_2 = -(return_bins * clipped_value_bins.log_softmax(dim = 1)).sum(dim = 1)
+        value_loss = -(return_bins * value_bins.log_softmax(dim = 1)).sum(dim = 1)
 
-        value_loss = torch.maximum(value_loss_1, value_loss_2)
+        # maybe clip values
 
-        # maybe variable length
+        if self.clip_values:
+            clipped_values = old_values + (values - old_values).clamp(-self.value_clip, self.value_clip)
+            clipped_value_bins = self.reward_encoder(clipped_values)
+            clipped_value_bins = rearrange(clipped_value_bins, 'b t l -> b l t')
 
-        if is_var_len:
-            value_loss = value_loss[mask].mean()
-        else:
-            value_loss = value_loss.mean()
+            clipped_value_loss = -(return_bins * log(clipped_value_bins)).sum(dim = 1)
+            value_loss = torch.maximum(value_loss, clipped_value_loss)
+
+        # mask out bootstrapped terminal step from bounds seamlessly
+
+        value_loss = value_loss[mask].mean()
 
         # maybe take value optimizer step
 
-        if exists(policy_optim):
+        if exists(value_optim):
             value_loss.backward()
 
             value_optim.step()
@@ -3654,6 +3967,7 @@ class DynamicsWorldModel(Module):
         time_cache: Tensor | None = None,
         use_time_cache = True,
         return_rewards_per_frame = False,
+        return_terminals = False,
         return_agent_actions = False,
         return_log_probs_and_values = False,
         return_for_policy_optimization = False,
@@ -3676,6 +3990,7 @@ class DynamicsWorldModel(Module):
             return_agent_actions |= True
             return_log_probs_and_values |= True
             return_rewards_per_frame |= True
+            return_terminals |= self.predict_terminals
 
         # more variables
 
@@ -3746,10 +4061,10 @@ class DynamicsWorldModel(Module):
 
         if return_agent_actions:
             num_discrete_action_types = self.action_embedder.num_discrete_action_types
-            decoded_discrete_actions = prompt_discrete_actions.clone() if exists(prompt_discrete_actions) else empty((batch_size, 0, num_discrete_action_types), device = self.device, dtype = torch.long)
+            decoded_discrete_actions = prompt_discrete_actions.clone() if exists(prompt_discrete_actions) else empty((batch_size, 0, num_discrete_action_types), device = self.device, dtype = torch.long) if num_discrete_action_types > 0 else None
 
             num_continuous_action_types = self.action_embedder.num_continuous_action_types
-            decoded_continuous_actions = prompt_continuous_actions.clone() if exists(prompt_continuous_actions) else empty((batch_size, 0, num_continuous_action_types), device = self.device, dtype = torch.float)
+            decoded_continuous_actions = prompt_continuous_actions.clone() if exists(prompt_continuous_actions) else empty((batch_size, 0, num_continuous_action_types), device = self.device, dtype = torch.float) if num_continuous_action_types > 0 else None
         else:
             decoded_discrete_actions = prompt_discrete_actions
             decoded_continuous_actions = prompt_continuous_actions
@@ -3778,8 +4093,16 @@ class DynamicsWorldModel(Module):
                 decoded_rewards = empty((batch_size, 0), device = self.device, dtype = torch.float32)
 
         # LeWM needs at least one seed frame to predict the next; bootstrap with random if no prompt
+
         if self.use_lewm_dynamics and latents.shape[1] == 0:
             latents = randn((batch_size, 1, self.num_video_views, *latent_shape), device = self.device)
+
+        # maybe return terminals
+
+        decoded_terminals = torch.zeros((batch_size,), device = self.device, dtype = torch.bool)
+        decoded_lens = full((batch_size,), time_steps, device = self.device)
+
+        should_predict_terminals = return_terminals and self.predict_terminals
 
         # while all the frames of the video (per latent) is not generated
 
@@ -3983,32 +4306,43 @@ class DynamicsWorldModel(Module):
                 if has_proprio:
                     denoised_proprio = noised_proprio
 
-            # take care of the rewards by predicting on the agent token embedding
+            # take care of the rewards by predicting on the agent token embedding on the last denoising step
+
+            needs_agent_embed = return_rewards_per_frame or should_predict_terminals or store_agent_embed or return_agent_actions
+
+            if needs_agent_embed:
+                one_agent_embed = embeds.agent[:, -1:, agent_index]
 
             if return_rewards_per_frame:
-                agent_embed = embeds.agent
-
-                one_agent_embed = agent_embed[:, -1:, agent_index]
-
                 reward_logits = self.to_reward_pred.forward_one(one_agent_embed, id = 0)
-                pred_reward = self.reward_encoder.bins_to_scalar_value(reward_logits, normalize = True)
+                pred_reward = self.reward_encoder.bins_to_scalar_value(reward_logits)
 
                 decoded_rewards = cat((decoded_rewards, pred_reward), dim = 1)
+
+            # maybe predict terminals
+
+            if should_predict_terminals:
+                pooled_latents = reduce(denoised_latent, 'b t v n d -> b t d', 'mean')
+                state_terminal_logits = self.to_state_terminal_pred(pooled_latents)
+
+                # bernoulli sampling
+
+                is_terminal = torch.bernoulli(state_terminal_logits.sigmoid()) == 1.
+                is_terminal = rearrange(is_terminal, 'b 1 -> b')
+
+                just_terminated = is_terminal & ~decoded_terminals
+                decoded_lens.masked_fill_(just_terminated, curr_time_steps + 1)
+                decoded_terminals |= is_terminal
 
             # maybe store agent embed
 
             if store_agent_embed:
-                agent_embed = embeds.agent
-
-                one_agent_embed = agent_embed[:, -1:, agent_index]
                 acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
 
             # decode the agent actions if needed
 
             if return_agent_actions:
                 assert self.action_embedder.has_actions
-
-                one_agent_embed = agent_embed[:, -1:, agent_index]
 
                 policy_embed = self.policy_head(one_agent_embed)
 
@@ -4061,6 +4395,11 @@ class DynamicsWorldModel(Module):
 
                 past_proprio_context_noise = cat((past_proprio_context_noise, randn_like(denoised_proprio)), dim = 1)
 
+            # maybe early break if entirely terminated
+
+            if should_predict_terminals and decoded_terminals.all():
+                break
+
         # LeWM: final forward pass to decode agent embed for the last generated frame
         # (the loop decodes rewards/actions from the forward pass *before* appending,
         #  so the last appended frame has no decoded agent embed yet)
@@ -4092,20 +4431,17 @@ class DynamicsWorldModel(Module):
             )
 
             if return_rewards_per_frame:
-                agent_embed = embeds.agent
-                one_agent_embed = agent_embed[:, -1:, agent_index]
+                one_agent_embed = embeds.agent[:, -1:, agent_index]
                 reward_logits = self.to_reward_pred.forward_one(one_agent_embed, id = 0)
-                pred_reward = self.reward_encoder.bins_to_scalar_value(reward_logits, normalize = True)
+                pred_reward = self.reward_encoder.bins_to_scalar_value(reward_logits)
                 decoded_rewards = cat((decoded_rewards, pred_reward), dim = 1)
 
             if store_agent_embed:
-                agent_embed = embeds.agent
-                one_agent_embed = agent_embed[:, -1:, agent_index]
+                one_agent_embed = embeds.agent[:, -1:, agent_index]
                 acc_agent_embed = safe_cat((acc_agent_embed, one_agent_embed), dim = 1)
 
             if return_agent_actions:
-                agent_embed = embeds.agent
-                one_agent_embed = agent_embed[:, -1:, agent_index]
+                one_agent_embed = embeds.agent[:, -1:, agent_index]
                 policy_embed = self.policy_head(one_agent_embed)
 
                 if store_old_action_unembeds:
@@ -4188,7 +4524,8 @@ class DynamicsWorldModel(Module):
         # returning agent actions, rewards, and log probs + values for policy optimization
 
         batch, device = latents.shape[0], latents.device
-        experience_lens = full((batch,), time_steps, device = device)
+
+        is_truncated = ~decoded_terminals
 
         gen = Experience(
             latents = latents,
@@ -4198,7 +4535,9 @@ class DynamicsWorldModel(Module):
             old_action_unembeds = self.action_embedder.unembed(acc_policy_embed, pred_head_index = 0) if exists(acc_policy_embed) and store_old_action_unembeds else None,
             step_size = step_size,
             agent_index = agent_index,
-            lens = experience_lens,
+            lens = decoded_lens,
+            is_truncated = is_truncated,
+            terminals = decoded_terminals,
             is_from_world_model = True
         )
 
@@ -4230,6 +4569,7 @@ class DynamicsWorldModel(Module):
         latent_gene_ids = None,          # (b)
         tasks = None,                    # (b)
         rewards = None,                  # (b t) | (b t-1) during generation
+        terminals = None,                # (b)
         discrete_actions = None,         # (b t na) | (b t-1 na)
         continuous_actions = None,       # (b t na) | (b t-1 na)
         shift_action_tokens = True,      # set to False if actions already properly paired, which is different than the usual replay buffer pairing
@@ -4486,7 +4826,9 @@ class DynamicsWorldModel(Module):
 
             action_tokens = add('1 d, b t d', self.action_learned_embed, action_tokens)
 
-            if action_len == time and shift_action_tokens:
+            is_sequential_step = exists(time_cache) and time == 1 and action_len == 1
+
+            if action_len == time and shift_action_tokens and not is_sequential_step:
                 # handle first timestep not having an associated past action
                 # in replay buffers for rl, typically the action paired up with the state is the very next one, not the previous one that led up to that state
                 # next_action_tokens contains the actual actions from t=1 to t=time-1
@@ -4771,15 +5113,20 @@ class DynamicsWorldModel(Module):
         # now take care of the agent token losses
 
         reward_loss = self.zero
+        state_terminal_loss = self.zero
 
-        if exists(rewards):
+        needs_agent_pred = exists(rewards)
 
+        if needs_agent_pred:
             encoded_agent_tokens = embeds.agent
 
-            if rewards.ndim == 2: # (b t)
+            if encoded_agent_tokens.ndim == 4:
                 encoded_agent_tokens = reduce(encoded_agent_tokens, 'b t g d -> b t d', 'mean')
 
-            reward_pred = self.to_reward_pred(encoded_agent_tokens[:, :-1])
+            agent_tokens_shifted = encoded_agent_tokens[:, :-1]
+
+        if exists(rewards):
+            reward_pred = self.to_reward_pred(agent_tokens_shifted)
 
             reward_pred = rearrange(reward_pred, 'mtp b t l -> b l t mtp')
 
@@ -4795,6 +5142,32 @@ class DynamicsWorldModel(Module):
                 reward_loss = reward_losses[loss_mask_without_last].mean(dim = 0)
             else:
                 reward_loss = reduce(reward_losses, '... mtp -> mtp', 'mean') # they sum across the prediction steps (mtp dimension) - eq(9)
+
+        # terminal prediction loss
+
+        if exists(terminals) and self.predict_terminals:
+            pooled_latents = reduce(latents[:, 1:], 'b t v n d -> b t d', 'mean')
+            state_terminal_pred = self.to_state_terminal_pred(pooled_latents)
+
+            if terminals.ndim == 1:
+                last_transition = (lens - 2).clamp(min = 0) if is_var_len else full((batch,), max(time - 2, 0), device = device)
+                terminals_seq = flags_to_sequence(terminals, last_transition, max(time - 1, 0))
+            else:
+                terminals_seq = terminals[:, 1:]
+
+            terminals_seq = terminals_seq.float()
+
+            # label smoothing trick from dreamerv3 - clamp targets to [1/H, 1 - 1/H] where H = 1 / (1 - γ)
+
+            eps = 1. - self.gae_discount_factor
+            terminals_seq = terminals_seq.clamp(min = eps, max = 1. - eps)
+
+            state_terminal_losses = F.binary_cross_entropy_with_logits(state_terminal_pred, terminals_seq, reduction = 'none')
+
+            if is_var_len:
+                state_terminal_loss = state_terminal_losses[loss_mask_without_last].mean()
+            else:
+                state_terminal_loss = state_terminal_losses.mean()
 
         # maybe autoregressive state prediction loss
 
@@ -4822,7 +5195,10 @@ class DynamicsWorldModel(Module):
         discrete_action_loss = self.zero
         continuous_action_loss = self.zero
 
+        has_action_loss_weight = (self.discrete_action_loss_weight.sum() + self.continuous_action_loss_weight.sum()) > 0
+
         if (
+            has_action_loss_weight and
             self.num_agents == 1 and
             add_autoregressive_action_loss and
             time > 1 and
@@ -4945,6 +5321,10 @@ class DynamicsWorldModel(Module):
         if exists(rewards) and exists(self.reward_loss_normalizer):
             reward_loss = self.reward_loss_normalizer(reward_loss, update_ema = update_loss_ema)
 
+        if exists(terminals):
+            if exists(self.state_terminal_loss_normalizer):
+                state_terminal_loss = self.state_terminal_loss_normalizer(state_terminal_loss, update_ema = update_loss_ema)
+
         if exists(discrete_actions) and exists(self.discrete_actions_loss_normalizer):
             discrete_action_loss = self.discrete_actions_loss_normalizer(discrete_action_loss, update_ema = update_loss_ema)
 
@@ -4985,6 +5365,7 @@ class DynamicsWorldModel(Module):
             flow_loss * self.latent_flow_loss_weight +
             shortcut_flow_loss * self.shortcut_loss_weight +
             (reward_loss * self.reward_loss_weight).sum() +
+            (state_terminal_loss * self.terminal_loss_weight) +
             (discrete_action_loss * self.discrete_action_loss_weight).sum() +
             (continuous_action_loss * self.continuous_action_loss_weight).sum() +
             (state_pred_loss * self.state_pred_loss_weight) +
@@ -4993,7 +5374,7 @@ class DynamicsWorldModel(Module):
             (latent_ar_sigreg_loss * self.latent_ar_sigreg_loss_weight)
         )
 
-        losses = WorldModelLosses(flow_loss, shortcut_flow_loss, reward_loss, discrete_action_loss, continuous_action_loss, state_pred_loss, agent_state_pred_loss, latent_ar_loss, latent_ar_sigreg_loss)
+        losses = WorldModelLosses(flow_loss, shortcut_flow_loss, reward_loss, state_terminal_loss, discrete_action_loss, continuous_action_loss, state_pred_loss, agent_state_pred_loss, latent_ar_loss, latent_ar_sigreg_loss)
 
         if not (return_all_losses or return_intermediates):
             return total_loss

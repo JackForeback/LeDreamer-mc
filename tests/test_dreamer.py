@@ -21,6 +21,7 @@ def exists(v):
 @param('with_latent_ar_in_dynamics', (False, True))
 @param('with_latent_ar_action_conditioned', (False, True))
 @param('use_lewm_dynamics', (False, True))
+@param('predict_terminals', (False, True))
 def test_e2e(
     pred_orig_latent,
     grouped_query_attn,
@@ -37,7 +38,8 @@ def test_e2e(
     time_attention_use_pope,
     with_latent_ar_in_dynamics,
     with_latent_ar_action_conditioned,
-    use_lewm_dynamics
+    use_lewm_dynamics,
+    predict_terminals
 ):
     from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
 
@@ -101,6 +103,7 @@ def test_e2e(
         lewm_sigreg_loss_weight = 0.05 if use_lewm_dynamics else 0.,
         lewm_layer = 0 if use_lewm_dynamics else -1,
         lewm_action_conditioned = condition_on_actions and use_lewm_dynamics,
+        predict_terminals = predict_terminals
     )
 
     signal_levels = step_sizes_log2 = None
@@ -126,10 +129,15 @@ def test_e2e(
     if var_len:
         lens = torch.randint(1, 4, (2,))
 
+    terminals = None
+    if predict_terminals:
+        terminals = (torch.randn(2) > 0.).bool()
+
     flow_loss = dynamics(
         **dynamics_input,
         lens = lens,
         tasks = tasks,
+        terminals = terminals,
         signal_levels = signal_levels,
         step_sizes_log2 = step_sizes_log2,
         discrete_actions = actions,
@@ -146,6 +154,7 @@ def test_e2e(
         image_width = 32,
         batch_size = 2,
         return_rewards_per_frame = True,
+        return_terminals = predict_terminals,
         use_time_cache = use_time_cache
     )
 
@@ -270,7 +279,7 @@ def test_action_with_world_model():
     discrete_actions, continuous_actions = gen.actions
 
     assert discrete_actions.shape == (4, 16, 1)
-    assert continuous_actions is None
+    assert continuous_actions is None or continuous_actions.numel() == 0
 
     discrete_log_probs, _ = gen.log_probs
 
@@ -521,7 +530,10 @@ def test_tokenizer_trainer():
             return 2
 
         def __getitem__(self, idx):
-            return torch.randn(3, 2, 64, 64)
+            return dict(
+                video = torch.randn(3, 2, 64, 64),
+                time_lens = 2
+            )
 
     dataset = MockDataset()
 
@@ -680,12 +692,14 @@ def test_cache_generate():
 @param('env_can_terminate', (False, True))
 @param('env_can_truncate', (False, True))
 @param('store_agent_embed', (False, True))
+@param('predict_terminals', (False, True))
 def test_online_rl(
     vectorized,
     use_pmpo,
     env_can_terminate,
     env_can_truncate,
-    store_agent_embed
+    store_agent_embed,
+    predict_terminals
 ):
     from dreamer4.dreamer4 import DynamicsWorldModel, VideoTokenizer
 
@@ -698,8 +712,8 @@ def test_online_rl(
         patch_size = 32,
         attn_dim_head = 16,
         num_latent_tokens = 1,
-        image_height = 256,
-        image_width = 256,
+        image_height = 32,
+        image_width = 32,
     )
 
     world_model_and_policy = DynamicsWorldModel(
@@ -722,7 +736,7 @@ def test_online_rl(
     from dreamer4.dreamer4 import combine_experiences
 
     mock_env = MockEnv(
-        (256, 256),
+        (32, 32),
         vectorized = vectorized,
         num_envs = 4,
         terminate_after_step = 2 if env_can_terminate else None,
@@ -732,7 +746,7 @@ def test_online_rl(
 
     # manually
 
-    dream_experience = world_model_and_policy.generate(10, batch_size = 1, store_agent_embed = store_agent_embed, return_for_policy_optimization = True)
+    dream_experience = world_model_and_policy.generate(10, batch_size = 1, store_agent_embed = store_agent_embed, return_terminals = predict_terminals, return_for_policy_optimization = True)
 
     one_experience = world_model_and_policy.interact_with_env(mock_env, max_timesteps = 8, env_is_vectorized = vectorized, store_agent_embed = store_agent_embed)
     another_experience = world_model_and_policy.interact_with_env(mock_env, max_timesteps = 16, env_is_vectorized = vectorized, store_agent_embed = store_agent_embed)
@@ -1065,3 +1079,91 @@ def test_rac_like_tokenizer(steps):
         recon_video = model.decode(latents, height = height, width = width)
 
     assert recon_video.shape == (batch, channels, time, height, width)
+
+@param('use_time_rnn', (False, True))
+@param('use_causal_conv3d', (False, True))
+def test_e2e_sequential_parallel_cache(use_time_rnn, use_causal_conv3d):
+    import torch
+    from dreamer4.dreamer4 import VideoTokenizer, DynamicsWorldModel
+
+    tokenizer = VideoTokenizer(
+        dim = 16,
+        dim_latent = 16,
+        patch_size = 32,
+        image_height = 64,
+        image_width = 64,
+        num_latent_tokens = 4,
+        encoder_depth = 2,
+        decoder_depth = 2,
+        time_block_every = 2,
+        attn_heads = 4,
+        attn_dim_head = 16,
+        use_causal_conv3d = use_causal_conv3d
+    ).eval()
+
+    dynamics = DynamicsWorldModel(
+        dim = 32,
+        dim_latent = tokenizer.dim_latent,
+        num_latent_tokens = tokenizer.num_latent_tokens,
+        num_discrete_actions = 2,
+        video_tokenizer = tokenizer,
+        depth = 1,
+        time_block_every = 1,
+        policy_head_mlp_depth = 2,
+        value_head_mlp_depth = 2,
+        attn_heads = 4,
+        attn_dim_head = 16,
+        use_time_rnn = use_time_rnn
+    ).eval()
+
+    video = torch.randn(1, 3, 4, 64, 64)
+    discrete_actions = torch.randint(0, 2, (1, 4, 1))
+
+    with torch.no_grad():
+        latents_parallel, tokenizer_cache_parallel = tokenizer(
+            video,
+            return_latents = True,
+            return_time_cache = True
+        )
+
+        step_sizes = torch.ones((1,))
+        signal_levels = torch.full((1, 4), dynamics.max_steps - 1)
+
+        _, (embeds_parallel, _) = dynamics(
+            latents = latents_parallel,
+            signal_levels = signal_levels,
+            step_sizes = step_sizes,
+            discrete_actions = discrete_actions,
+            return_pred_only = True,
+            return_intermediates = True
+        )
+
+        policy_embed_parallel = dynamics.policy_head(embeds_parallel.agent)
+
+        tokenizer_cache_sequential = dynamics_cache_sequential = None
+        policy_embed_sequential = []
+
+        for frame_idx in range(4):
+            latents_sequential, tokenizer_cache_sequential = tokenizer(
+                video[:, :, frame_idx],
+                return_latents = True,
+                time_cache = tokenizer_cache_sequential,
+                return_time_cache = True
+            )
+            seq_action = None if frame_idx == 0 else discrete_actions[:, frame_idx-1:frame_idx]
+
+            _, (intermediates_sequential, dynamics_cache_sequential) = dynamics(
+                latents = latents_sequential,
+                signal_levels = signal_levels[:, frame_idx:frame_idx+1],
+                step_sizes = step_sizes,
+                discrete_actions = seq_action,
+                time_cache = dynamics_cache_sequential,
+                return_pred_only = True,
+                return_intermediates = True
+            )
+
+            policy_embed_sequential.append(dynamics.policy_head(intermediates_sequential.agent))
+
+        policy_embed_sequential = torch.cat(policy_embed_sequential, dim = 1)
+
+    assert torch.allclose(policy_embed_parallel, policy_embed_sequential, atol = 1e-4)

@@ -7,7 +7,7 @@ import torch
 from torch import is_tensor, tensor
 from torch.nn import Module
 from torch.optim import AdamW
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, TensorDataset
 
 import torchvision.transforms as T
 
@@ -277,10 +277,14 @@ class VideoTokenizerTrainer(Module):
 
             for _ in range(self.grad_accum_every):
                 data = next(iter_train_dl)
-                video = data if is_tensor(data) else data['video']
+
+                is_dict = isinstance(data, dict)
+                video = data['video'] if is_dict else data
+                time_lens = data.get('time_lens') if is_dict else None
 
                 loss, (losses, recon_video) = self.model(
                     video,
+                    time_lens = time_lens,
                     update_loss_ema = True,
                     return_intermediates = True
                 )
@@ -311,10 +315,16 @@ class VideoTokenizerTrainer(Module):
 
             if self.log_video_flag and divisible_by(self.step.item(), self.log_video_every) and self.is_main_process:
 
-                if self.use_ema:
-                    self.ema_model.eval()
-                    with torch.no_grad():
-                        _, (_, recon_video) = self.ema_model(video, return_intermediates = True)
+                sample_model = self.ema_model.ema_model if self.use_ema else self.model
+
+                sample_model.eval()
+
+                with torch.no_grad():
+                    if self.model.has_flow:
+                        latents = sample_model.tokenize(video)
+                        recon_video = sample_model.decode(latents, height = video.shape[-2], width = video.shape[-1])
+                    else:
+                        _, (_, recon_video) = sample_model(video, return_intermediates = True)
 
                 recon_video = recon_video.clamp(0., 1.)
                 self.log_video(video, "original_video")
@@ -652,6 +662,7 @@ class BehaviorCloneTrainer(Module):
             real_video = batch_data['video'][:self.sample_batch_size]
 
         image_size = prompt_video.shape[-1]
+        sample_batch_size = prompt_video.shape[0]
 
         kwargs = dict()
         is_autoregressive = exists(self.sample_autoregressive_actions) and self.sample_autoregressive_actions
@@ -685,7 +696,7 @@ class BehaviorCloneTrainer(Module):
         generated_video = unwrapped.generate(
             prompt = prompt_video,
             time_steps = self.sample_time_steps,
-            batch_size = self.sample_batch_size,
+            batch_size = sample_batch_size,
             image_height = image_size,
             image_width = image_size,
             return_decoded_video = True,
