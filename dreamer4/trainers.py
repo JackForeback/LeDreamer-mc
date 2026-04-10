@@ -78,6 +78,74 @@ def cycle(dl):
         for batch in dl:
             yield batch
 
+# Accelerate's register_for_checkpointing only accepts objects that expose
+# state_dict() / load_state_dict(). We keep the step counter as a tensor
+# buffer on the trainer (because the existing code does self.step += 1 and
+# self.step.item() everywhere), and register a thin proxy that copies the
+# buffer in/out on save/load. This way accelerator.save_state and
+# accelerator.load_state round-trip the step count alongside model/optimizer.
+
+class _StepBufferCheckpointProxy:
+    def __init__(self, trainer):
+        self._trainer = trainer
+
+    def state_dict(self):
+        return {'value': int(self._trainer.step.item())}
+
+    def load_state_dict(self, sd):
+        self._trainer.step.copy_(tensor(int(sd.get('value', 0))))
+
+
+# MuonAdamAtan2 stores its `muon_bypass_update_fn` default as a lambda in
+# every param_group. Lambdas cannot be pickled, which crashes
+# accelerator.save_state (it pickles optimizer.state_dict via torch.save).
+# Replace the lambda with a module-level equivalent so state_dict is
+# picklable — this function has exactly the same semantics as the original:
+# skip the Muon update path for params whose ndim is < 2 or > 3.
+
+def _muon_bypass_update_fn(ndim: int) -> bool:
+    return ndim < 2 or ndim > 3
+
+
+def _make_muon_pickle_safe(optim):
+    """Strip unpicklable lambdas from a MuonAdamAtan2 optimizer in-place."""
+    for group in optim.param_groups:
+        fn = group.get('muon_bypass_update_fn', None)
+        if fn is not None and getattr(fn, '__name__', '') == '<lambda>':
+            group['muon_bypass_update_fn'] = _muon_bypass_update_fn
+
+
+def _build_muon_adam_atan2(muon_params, params, **kwargs):
+    """Construct MuonAdamAtan2 with a deterministic param ordering.
+
+    The upstream constructor does `list(set(params) - set(muon_params))` to
+    split Adam-only params from Muon params, but `set()` iteration order is
+    non-deterministic across optimizer instances. This causes
+    `accelerator.load_state` to map optimizer moments onto the wrong
+    parameters (because the state_dict stores by position), resulting in
+    shape-mismatch errors on the first step after resume.
+
+    Fix: do the deterministic filtering ourselves and pass
+    `remove_muon_params_from_params=False` so the upstream set-diff is a no-op.
+    """
+    muon_set = {id(p) for p in muon_params}
+    adam_only = [p for p in params if id(p) not in muon_set]
+    return MuonAdamAtan2(
+        muon_params,
+        adam_only,
+        remove_muon_params_from_params = False,
+        **kwargs,
+    )
+
+
+# Accelerate uses torch.load(..., weights_only=True) under the hood, which
+# rejects arbitrary callables. Allowlist our own substitute so optimizer
+# state round-trips cleanly.
+try:
+    torch.serialization.add_safe_globals([_muon_bypass_update_fn])
+except (AttributeError, TypeError):
+    pass  # older torch without safe_globals; fine, weights_only=False path works
+
 # trainers
 
 class VideoTokenizerTrainer(Module):
@@ -97,6 +165,7 @@ class VideoTokenizerTrainer(Module):
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
         cpu = False,
+        mixed_precision: str = 'no',  # 'no' | 'fp16' | 'bf16'
         use_ema = False,
         ema_decay = 0.999,
         use_tensorboard_logger = False,
@@ -106,7 +175,11 @@ class VideoTokenizerTrainer(Module):
         video_fps = -1,
         log_video_every = 1000,
         checkpoint_every = 2500,
-        checkpoint_folder = './checkpoints_tokenizer'
+        checkpoint_folder = './checkpoints_tokenizer',
+        dataloader_num_workers: int = 0,
+        dataloader_pin_memory: bool = False,
+        dataloader_persistent_workers: bool | None = None,
+        resume_from: str | None = None,
     ):
         super().__init__()
         batch_size = min(batch_size, len(dataset))
@@ -116,6 +189,7 @@ class VideoTokenizerTrainer(Module):
 
         self.accelerator = Accelerator(
             cpu = cpu,
+            mixed_precision = mixed_precision,
             **accelerate_kwargs
         )
 
@@ -147,7 +221,21 @@ class VideoTokenizerTrainer(Module):
         self.checkpoint_path = checkpoint_path
 
         self.dataset = dataset
-        self.train_dataloader = DataLoader(dataset, batch_size = batch_size, drop_last = True, shuffle = True)
+
+        # DataLoader perf knobs: parallel workers + pinned memory overlap CPU
+        # decoding with GPU compute so data prep is not the bottleneck.
+        if dataloader_persistent_workers is None:
+            dataloader_persistent_workers = dataloader_num_workers > 0
+        dl_kwargs = dict(
+            batch_size = batch_size,
+            drop_last = True,
+            shuffle = True,
+            num_workers = dataloader_num_workers,
+            pin_memory = dataloader_pin_memory,
+        )
+        if dataloader_num_workers > 0:
+            dl_kwargs['persistent_workers'] = dataloader_persistent_workers
+        self.train_dataloader = DataLoader(dataset, **dl_kwargs)
 
         optim_kwargs = dict(
             lr = learning_rate,
@@ -155,11 +243,12 @@ class VideoTokenizerTrainer(Module):
         )
 
         if optim_klass is MuonAdamAtan2:
-            optim = MuonAdamAtan2(
-                model.muon_parameters(),
-                model.parameters(),
+            optim = _build_muon_adam_atan2(
+                list(model.muon_parameters()),
+                list(model.parameters()),
                 **optim_kwargs
             )
+            _make_muon_pickle_safe(optim)
         else:
             optim = optim_klass(
                 model.parameters(),
@@ -175,6 +264,9 @@ class VideoTokenizerTrainer(Module):
         self.batch_size = batch_size
 
         self.register_buffer('step', tensor(0))
+        # Register the step counter with the accelerator so it round-trips
+        # through accelerator.save_state / accelerator.load_state.
+        self.accelerator.register_for_checkpointing(_StepBufferCheckpointProxy(self))
 
         self.ema_model = None
         if self.use_ema and self.accelerator.is_main_process:
@@ -198,6 +290,19 @@ class VideoTokenizerTrainer(Module):
 
         if exists(self.ema_model):
             self.ema_model.to(self.device)
+
+        # Clean resume from an accelerator.save_state() dump. This restores
+        # model weights, optimizer moments, LR scheduler (if any), RNG state,
+        # and the `step` buffer we registered above — so training picks up
+        # exactly where it left off, no loss spike.
+        self.resume_from = resume_from
+        if exists(resume_from):
+            resume_path = Path(resume_from)
+            if resume_path.exists():
+                self.print(f"resuming training from {resume_path}")
+                self.accelerator.load_state(str(resume_path))
+            else:
+                self.print(f"warning: resume_from={resume_from} does not exist, starting fresh")
 
     @property
     def device(self):
@@ -364,34 +469,47 @@ class VideoTokenizerTrainer(Module):
 
             self.accelerator.wait_for_everyone()
 
-            if self.checkpoint_every > 0 and self.is_main_process and divisible_by(self.step.item(), self.checkpoint_every):
-                ckpt_path = self.checkpoint_folder / f'tokenizer-{self.step.item()}.pt'
+            if self.checkpoint_every > 0 and divisible_by(self.step.item(), self.checkpoint_every):
+                # 1. Full resumable state (model + optimizer + RNG + step buffer)
+                #    via Accelerate. This is what --resume_from consumes.
+                state_dir = self.checkpoint_folder / f'state-{self.step.item()}'
+                self.accelerator.save_state(str(state_dir))
 
-                model = self.unwrap_model(self.model)
-                config = getattr(model, '_config', None)
+                if self.is_main_process:
+                    # Write a pointer to the newest state dir so --resume_from
+                    # can auto-pick it without the user knowing the step number.
+                    latest_pointer = self.checkpoint_folder / 'latest_state.txt'
+                    latest_pointer.write_text(state_dir.name)
 
-                import pickle
-                from torch_einops_utils.save_load import dehydrate_config
-                pkg = dict(
-                    model = model.state_dict(),
-                    config = pickle.dumps(dehydrate_config(config, '_config')) if config else None,
-                    step = self.step.item()
-                )
-                torch.save(pkg, str(ckpt_path))
+                    # 2. Legacy model-only checkpoint (for Phase 2 hand-off and
+                    #    backwards compat with existing tooling).
+                    ckpt_path = self.checkpoint_folder / f'tokenizer-{self.step.item()}.pt'
 
-                if self.use_ema:
-                    ema_ckpt_path = self.checkpoint_folder / f'tokenizer-{self.step.item()}-ema.pt'
-                    ema_model = self.ema_model.ema_model
+                    model = self.unwrap_model(self.model)
+                    config = getattr(model, '_config', None)
 
-                    ema_config = getattr(ema_model, '_config', None)
-                    ema_pkg = dict(
-                        model = ema_model.state_dict(),
-                        config = pickle.dumps(dehydrate_config(ema_config, '_config')) if ema_config else None,
+                    import pickle
+                    from torch_einops_utils.save_load import dehydrate_config
+                    pkg = dict(
+                        model = model.state_dict(),
+                        config = pickle.dumps(dehydrate_config(config, '_config')) if config else None,
                         step = self.step.item()
                     )
-                    torch.save(ema_pkg, str(ema_ckpt_path))
+                    torch.save(pkg, str(ckpt_path))
 
-                self.print(f"checkpoint saved to {ckpt_path}")
+                    if self.use_ema:
+                        ema_ckpt_path = self.checkpoint_folder / f'tokenizer-{self.step.item()}-ema.pt'
+                        ema_model = self.ema_model.ema_model
+
+                        ema_config = getattr(ema_model, '_config', None)
+                        ema_pkg = dict(
+                            model = ema_model.state_dict(),
+                            config = pickle.dumps(dehydrate_config(ema_config, '_config')) if ema_config else None,
+                            step = self.step.item()
+                        )
+                        torch.save(ema_pkg, str(ema_ckpt_path))
+
+                    self.print(f"checkpoint saved to {state_dir} (resumable) and {ckpt_path} (legacy)")
 
         self.accelerator.end_training()
 
@@ -413,6 +531,7 @@ class BehaviorCloneTrainer(Module):
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
         cpu = False,
+        mixed_precision: str = 'no',  # 'no' | 'fp16' | 'bf16'
         use_tensorboard_logger = False,
         log_dir: str | None = None,
         project_name = 'dreamer4',
@@ -436,7 +555,11 @@ class BehaviorCloneTrainer(Module):
         self_flow_loss_weight = 1.0,
         self_flow_kwargs: dict = dict(),
         collate_fn = None,
-        custom_sample_fn = None
+        custom_sample_fn = None,
+        dataloader_num_workers: int = 0,
+        dataloader_pin_memory: bool = False,
+        dataloader_persistent_workers: bool | None = None,
+        resume_from: str | None = None,
     ):
         super().__init__()
         batch_size = min(batch_size, len(dataset))
@@ -446,6 +569,7 @@ class BehaviorCloneTrainer(Module):
 
         self.accelerator = Accelerator(
             cpu = cpu,
+            mixed_precision = mixed_precision,
             **accelerate_kwargs
         )
 
@@ -454,7 +578,22 @@ class BehaviorCloneTrainer(Module):
 
         self.model = model
         self.dataset = dataset
-        self.train_dataloader = DataLoader(dataset, batch_size = batch_size, drop_last = True, shuffle = True, collate_fn = collate_fn)
+
+        # DataLoader perf knobs: parallel workers + pinned memory overlap CPU
+        # decoding with GPU compute so data prep is not the bottleneck.
+        if dataloader_persistent_workers is None:
+            dataloader_persistent_workers = dataloader_num_workers > 0
+        dl_kwargs = dict(
+            batch_size = batch_size,
+            drop_last = True,
+            shuffle = True,
+            collate_fn = collate_fn,
+            num_workers = dataloader_num_workers,
+            pin_memory = dataloader_pin_memory,
+        )
+        if dataloader_num_workers > 0:
+            dl_kwargs['persistent_workers'] = dataloader_persistent_workers
+        self.train_dataloader = DataLoader(dataset, **dl_kwargs)
 
         self.custom_sample_fn = custom_sample_fn
 
@@ -494,11 +633,12 @@ class BehaviorCloneTrainer(Module):
             model_params.extend(self.self_flow_module.parameters())
 
         if optim_klass is MuonAdamAtan2:
-            optim = MuonAdamAtan2(
+            optim = _build_muon_adam_atan2(
                 muon_params,
                 model_params,
                 **optim_kwargs
             )
+            _make_muon_pickle_safe(optim)
         else:
             optim = optim_klass(
                 model_params,
@@ -513,6 +653,9 @@ class BehaviorCloneTrainer(Module):
         self.batch_size = batch_size
 
         self.register_buffer('step', tensor(0))
+        # Register the step counter with the accelerator so it round-trips
+        # through accelerator.save_state / accelerator.load_state.
+        self.accelerator.register_for_checkpointing(_StepBufferCheckpointProxy(self))
 
         self.video_logger = None
         self.results_folder = None
@@ -565,6 +708,17 @@ class BehaviorCloneTrainer(Module):
 
         if exists(self.ema_model):
             self.ema_model.to(self.device)
+
+        # Clean resume from an accelerator.save_state() dump (see
+        # VideoTokenizerTrainer for the rationale).
+        self.resume_from = resume_from
+        if exists(resume_from):
+            resume_path = Path(resume_from)
+            if resume_path.exists():
+                self.print(f"resuming training from {resume_path}")
+                self.accelerator.load_state(str(resume_path))
+            else:
+                self.print(f"warning: resume_from={resume_from} does not exist, starting fresh")
 
     @property
     def device(self):
@@ -620,6 +774,19 @@ class BehaviorCloneTrainer(Module):
         ema_model.load_state_dict(ema_pkg.get('model', ema_pkg), strict = False)
 
     def save_checkpoint(self):
+        # 1. Full resumable state (model + optimizer + RNG + step buffer) via
+        #    Accelerate. All ranks participate. This is what --resume_from reads.
+        state_dir = self.checkpoint_folder / f'state-{self.step.item()}'
+        self.accelerator.save_state(str(state_dir))
+
+        if not self.is_main_process:
+            return
+
+        # Pointer to the newest state dir so --resume_from latest works.
+        latest_pointer = self.checkpoint_folder / 'latest_state.txt'
+        latest_pointer.write_text(state_dir.name)
+
+        # 2. Legacy model-only checkpoint for Phase 3 hand-off / backwards compat.
         import pickle
         from torch_einops_utils.save_load import dehydrate_config
 
@@ -647,7 +814,7 @@ class BehaviorCloneTrainer(Module):
             )
             torch.save(ema_pkg, str(ema_ckpt_path))
 
-        self.print(f"checkpoint saved to {ckpt_path}")
+        self.print(f"checkpoint saved to {state_dir} (resumable) and {ckpt_path} (legacy)")
 
     @eval_decorator
     @torch.no_grad()
@@ -871,9 +1038,13 @@ class DreamTrainer(Module):
         accelerate_kwargs: dict = dict(),
         optim_kwargs: dict = dict(),
         cpu = False,
+        mixed_precision: str = 'no',  # 'no' | 'fp16' | 'bf16'
         use_tensorboard_logger = False,
         log_dir: str | None = None,
-        project_name = 'dreamer4'
+        project_name = 'dreamer4',
+        checkpoint_every: int = 0,
+        checkpoint_folder: str = './checkpoints',
+        resume_from: str | None = None,
     ):
         super().__init__()
 
@@ -882,6 +1053,7 @@ class DreamTrainer(Module):
 
         self.accelerator = Accelerator(
             cpu = cpu,
+            mixed_precision = mixed_precision,
             **accelerate_kwargs
         )
 
@@ -905,8 +1077,14 @@ class DreamTrainer(Module):
         self.generate_timesteps = generate_timesteps
 
         self.register_buffer('step', tensor(0))
+        # Register the step counter with the accelerator so it round-trips
+        # through accelerator.save_state / accelerator.load_state.
+        self.accelerator.register_for_checkpointing(_StepBufferCheckpointProxy(self))
 
-        self.unwrapped_model = self.model
+        self.checkpoint_every = checkpoint_every
+        self.checkpoint_folder = Path(checkpoint_folder)
+        if checkpoint_every > 0:
+            self.checkpoint_folder.mkdir(parents = True, exist_ok = True)
 
         (
             self.model,
@@ -917,6 +1095,18 @@ class DreamTrainer(Module):
             self.policy_head_optim,
             self.value_head_optim
         )
+
+        # Clean resume from an accelerator.save_state() dump. First-ever
+        # checkpoint plumbing for Phase 3 — prior to this DreamTrainer could
+        # not be paused at all.
+        self.resume_from = resume_from
+        if exists(resume_from):
+            resume_path = Path(resume_from)
+            if resume_path.exists():
+                self.print(f"resuming training from {resume_path}")
+                self.accelerator.load_state(str(resume_path))
+            else:
+                self.print(f"warning: resume_from={resume_from} does not exist, starting fresh")
 
     @property
     def device(self):
@@ -936,10 +1126,25 @@ class DreamTrainer(Module):
     def log(self, **data):
         self.accelerator.log(data, step = self.step.item())
 
+    def save_checkpoint(self):
+        state_dir = self.checkpoint_folder / f'state-{self.step.item()}'
+        self.accelerator.save_state(str(state_dir))
+        if self.is_main_process:
+            latest_pointer = self.checkpoint_folder / 'latest_state.txt'
+            latest_pointer.write_text(state_dir.name)
+            self.print(f"dream checkpoint saved to {state_dir}")
+
     def forward(
         self
     ):
-        pbar = tqdm(range(self.num_train_steps), disable = not self.is_main_process)
+        # Honor the resumed step counter when building the progress bar, so
+        # a --resume_from run does not restart the step budget from zero.
+        pbar = tqdm(
+            range(self.step.item(), self.num_train_steps),
+            initial = self.step.item(),
+            total = self.num_train_steps,
+            disable = not self.is_main_process,
+        )
 
         for _ in pbar:
             dreams = self.unwrapped_model.generate(
@@ -985,6 +1190,9 @@ class DreamTrainer(Module):
             )
 
             self.step += 1
+
+            if self.checkpoint_every > 0 and divisible_by(self.step.item(), self.checkpoint_every):
+                self.save_checkpoint()
 
         self.accelerator.end_training()
 

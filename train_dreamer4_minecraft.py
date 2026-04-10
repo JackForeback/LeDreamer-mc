@@ -43,6 +43,8 @@ Usage:
 
 import os
 import argparse
+import sys
+from pathlib import Path
 
 import torch
 
@@ -57,6 +59,82 @@ from minecraft_vpt_dataset import (
     MinecraftVPTDataset,
     DREAMER4_NUM_DISCRETE_ACTIONS,
 )
+
+
+# ─── CUDA / resume helpers ───────────────────────────────────────────
+
+def _enforce_cuda_or_exit(args, phase_name: str) -> bool:
+    """Return True if the phase should run on CPU, False for GPU.
+
+    If CUDA is unavailable and --allow_cpu was not passed, print a loud
+    warning and exit(1). This prevents silently burning HPC walltime
+    on a CPU fallback caused by e.g. a CUDA driver version mismatch.
+    """
+    if torch.cuda.is_available():
+        print(f"[{phase_name}] CUDA OK — device={torch.cuda.get_device_name(0)} "
+              f"| torch={torch.__version__} | cuda={torch.version.cuda}")
+        return False
+
+    msg = (
+        "\n" + "=" * 70 + "\n"
+        f"[{phase_name}] ERROR: torch.cuda.is_available() is False.\n"
+        "This is almost always a CUDA driver / PyTorch mismatch.\n"
+        f"  torch version : {torch.__version__}\n"
+        f"  torch.cuda    : {torch.version.cuda}\n"
+        "Training on CPU for this model size is ~100x slower than a V100S.\n"
+        "To fix: install a PyTorch build matching your cluster driver, e.g.\n"
+        "pip install torch --index-url https://download.pytorch.org/whl/cu121\n"
+        "or ask your admin which CUDA version the driver supports.\n"
+        "\n"
+        "Pass --allow_cpu to override this check (e.g. for a laptop smoke test).\n"
+        + "=" * 70 + "\n"
+    )
+    if not getattr(args, 'allow_cpu', False):
+        print(msg, file=sys.stderr)
+        sys.exit(1)
+    print(msg, file=sys.stderr)
+    print(f"[{phase_name}] --allow_cpu set, proceeding on CPU (will be slow).",
+          file=sys.stderr)
+    return True
+
+
+def _resolve_resume_from(raw: str | None, output_dir: str) -> str | None:
+    """Resolve --resume_from into a concrete state-<N> directory path.
+
+    Acceptable inputs:
+      None                   → no resume
+      'latest'               → look in output_dir/latest_state.txt
+      <path to state-N dir>  → use as-is
+      <path to dir containing state-N dirs>
+                             → look for latest_state.txt inside it
+    """
+    if raw is None:
+        return None
+
+    if raw == 'latest':
+        base = Path(output_dir)
+    else:
+        base = Path(raw)
+
+    if base.is_dir():
+        # Accept either a state-<N> dir directly, or a parent with a pointer.
+        pointer = base / 'latest_state.txt'
+        if pointer.exists():
+            target = base / pointer.read_text().strip()
+            if target.exists():
+                print(f"[resume] using {target} from {pointer}")
+                return str(target)
+            print(f"[resume] pointer {pointer} references {target} but it does not exist")
+            return None
+        # Might already be a state-<N> dir
+        if (base / 'random_states_0.pkl').exists() or any(base.glob('*.safetensors')):
+            print(f"[resume] using state dir {base}")
+            return str(base)
+        print(f"[resume] {base} is not a state dir and has no latest_state.txt; starting fresh")
+        return None
+
+    print(f"[resume] resume_from path {base} does not exist; starting fresh")
+    return None
 
 
 # ─── Default Hyperparameters ────────────────────────────────────────
@@ -157,6 +235,9 @@ def train_tokenizer(args):
     print("PHASE 1: Training Video Tokenizer")
     print("=" * 60)
 
+    use_cpu = _enforce_cuda_or_exit(args, "Phase 1")
+    resume_from = _resolve_resume_from(args.resume_from, args.output_dir)
+
     # Load dataset — tokenizer only needs video, no actions
     dataset = MinecraftVPTDataset(
         data_dir=args.data_dir,
@@ -198,14 +279,18 @@ def train_tokenizer(args):
         learning_rate=args.tokenizer_lr,
         max_grad_norm=args.tokenizer_max_grad_norm,
         num_train_steps=args.num_steps or args.tokenizer_num_steps,
-        cpu=not torch.cuda.is_available(),
+        cpu=use_cpu,
+        mixed_precision=args.mixed_precision,
         use_tensorboard_logger=args.use_tensorboard,
         log_dir=args.output_dir,
         log_video=args.log_video,
         video_fps=20,
         log_video_every=args.log_video_every,
-        checkpoint_folder=args.output_dir
-        )
+        checkpoint_folder=args.output_dir,
+        dataloader_num_workers=args.num_workers,
+        dataloader_pin_memory=not args.no_pin_memory,
+        resume_from=resume_from,
+    )
 
     trainer()
 
@@ -248,6 +333,9 @@ def train_dynamics(args):
     print("=" * 60)
     print("PHASE 2: Training Dynamics World Model")
     print("=" * 60)
+
+    use_cpu = _enforce_cuda_or_exit(args, "Phase 2")
+    resume_from = _resolve_resume_from(args.resume_from, args.output_dir)
 
     # Load tokenizer from Phase 1 checkpoint
     assert args.tokenizer_ckpt is not None, "Must provide --tokenizer_ckpt for Phase 2"
@@ -300,11 +388,15 @@ def train_dynamics(args):
         learning_rate=args.dynamics_lr,
         max_grad_norm=args.dynamics_max_grad_norm,
         num_train_steps=args.num_steps or args.dynamics_num_steps,
-        cpu=not torch.cuda.is_available(),
+        cpu=use_cpu,
+        mixed_precision=args.mixed_precision,
         use_tensorboard_logger=args.use_tensorboard,
         log_dir=args.output_dir,
-        checkpoint_folder=args.output_dir
-        )
+        checkpoint_folder=args.output_dir,
+        dataloader_num_workers=args.num_workers,
+        dataloader_pin_memory=not args.no_pin_memory,
+        resume_from=resume_from,
+    )
 
     trainer()
 
@@ -349,6 +441,9 @@ def train_agent(args):
     print("PHASE 3: Training Agent in Dreams")
     print("=" * 60)
 
+    use_cpu = _enforce_cuda_or_exit(args, "Phase 3")
+    resume_from = _resolve_resume_from(args.resume_from, args.output_dir)
+
     # Load dynamics model from Phase 2
     assert args.dynamics_ckpt is not None, "Must provide --dynamics_ckpt for Phase 3"
     dyn_ckpt = torch.load(args.dynamics_ckpt, map_location='cpu', weights_only=False)
@@ -389,9 +484,13 @@ def train_agent(args):
         learning_rate=args.dream_lr,
         max_grad_norm=args.dream_max_grad_norm,
         num_train_steps=args.num_steps or args.dream_num_steps,
-        cpu=not torch.cuda.is_available(),
+        cpu=use_cpu,
+        mixed_precision=args.mixed_precision,
         use_tensorboard_logger=args.use_tensorboard,
         log_dir=args.output_dir,
+        checkpoint_every=args.dream_checkpoint_every,
+        checkpoint_folder=args.output_dir,
+        resume_from=resume_from,
     )
 
     trainer()
@@ -486,6 +585,31 @@ def main():
                         help="Log video reconstructions (Phase 1 only)")
     parser.add_argument("--log_video_every", type=int, default=1000,
                         help="Log video every N steps")
+
+    # Resume / checkpointing
+    parser.add_argument("--resume_from", type=str, default=None,
+                        help="Resume training from an accelerator.save_state() dump. "
+                             "Accepts either a specific state-<N>/ directory, the "
+                             "parent dir containing latest_state.txt, or the literal "
+                             "'latest' to read the pointer inside --output_dir.")
+    parser.add_argument("--dream_checkpoint_every", type=int, default=500,
+                        help="Phase 3: save a DreamTrainer checkpoint every N steps "
+                             "(0 to disable). Phases 1/2 use the trainer defaults.")
+
+    # Performance / hardware
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="DataLoader num_workers. Parallel frame decoding so "
+                             "data prep does not bottleneck GPU training.")
+    parser.add_argument("--no_pin_memory", action="store_true",
+                        help="Disable DataLoader pin_memory (default: enabled).")
+    parser.add_argument("--mixed_precision", type=str, default="no",
+                        choices=["no", "fp16", "bf16"],
+                        help="Mixed precision mode passed to Accelerate. "
+                             "Use 'fp16' on V100S (Volta), 'bf16' on A100/H100.")
+    parser.add_argument("--allow_cpu", action="store_true",
+                        help="Allow running on CPU when torch.cuda.is_available() "
+                             "is False. Without this flag, a missing GPU is a hard "
+                             "error — preventing a silent 24h CPU fallback.")
 
     args = parser.parse_args()
 
