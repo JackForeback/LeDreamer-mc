@@ -130,12 +130,23 @@ def _build_muon_adam_atan2(muon_params, params, **kwargs):
     """
     muon_set = {id(p) for p in muon_params}
     adam_only = [p for p in params if id(p) not in muon_set]
-    return MuonAdamAtan2(
-        muon_params,
-        adam_only,
-        remove_muon_params_from_params = False,
-        **kwargs,
-    )
+
+    import inspect
+    sig = inspect.signature(MuonAdamAtan2.__init__)
+    if 'remove_muon_params_from_params' in sig.parameters:
+        return MuonAdamAtan2(
+            muon_params,
+            adam_only,
+            remove_muon_params_from_params = False,
+            **kwargs,
+        )
+    else:
+        # Older version: pass pre-filtered lists directly
+        return MuonAdamAtan2(
+            muon_params,
+            adam_only,
+            **kwargs,
+        )
 
 
 # Accelerate uses torch.load(..., weights_only=True) under the hood, which
@@ -358,6 +369,38 @@ class VideoTokenizerTrainer(Module):
         ema_pkg = torch.load(str(ema_path), map_location = 'cpu', weights_only = True)
         ema_model.load_state_dict(ema_pkg.get('model', ema_pkg), strict = False)
 
+    def _save_tokenizer_checkpoint(self):
+        """Save both a resumable accelerator state and a legacy model-only checkpoint."""
+        step = self.step.item()
+
+        # 1. Full resumable state (model + optimizer + RNG + step buffer)
+        state_dir = self.checkpoint_folder / f'state-{step}'
+        self.accelerator.save_state(str(state_dir))
+
+        if self.is_main_process:
+            # Pointer so --resume_from latest works
+            latest_pointer = self.checkpoint_folder / 'latest_state.txt'
+            latest_pointer.write_text(state_dir.name)
+
+            # 2. Legacy model-only checkpoint (for Phase 2 hand-off)
+            ckpt_path = self.checkpoint_folder / f'tokenizer-{step}.pt'
+            model = self.unwrap_model(self.model)
+            pkg = dict(
+                model = model.state_dict(),
+                step = step,
+            )
+            torch.save(pkg, str(ckpt_path))
+
+            if self.use_ema:
+                ema_ckpt_path = self.checkpoint_folder / f'tokenizer-{step}-ema.pt'
+                ema_pkg = dict(
+                    model = self.ema_model.ema_model.state_dict(),
+                    step = step,
+                )
+                torch.save(ema_pkg, str(ema_ckpt_path))
+
+            self.print(f"checkpoint saved to {state_dir} (resumable) and {ckpt_path} (legacy)")
+
     def forward(
         self
     ):
@@ -470,46 +513,11 @@ class VideoTokenizerTrainer(Module):
             self.accelerator.wait_for_everyone()
 
             if self.checkpoint_every > 0 and divisible_by(self.step.item(), self.checkpoint_every):
-                # 1. Full resumable state (model + optimizer + RNG + step buffer)
-                #    via Accelerate. This is what --resume_from consumes.
-                state_dir = self.checkpoint_folder / f'state-{self.step.item()}'
-                self.accelerator.save_state(str(state_dir))
-
-                if self.is_main_process:
-                    # Write a pointer to the newest state dir so --resume_from
-                    # can auto-pick it without the user knowing the step number.
-                    latest_pointer = self.checkpoint_folder / 'latest_state.txt'
-                    latest_pointer.write_text(state_dir.name)
-
-                    # 2. Legacy model-only checkpoint (for Phase 2 hand-off and
-                    #    backwards compat with existing tooling).
-                    ckpt_path = self.checkpoint_folder / f'tokenizer-{self.step.item()}.pt'
-
-                    model = self.unwrap_model(self.model)
-                    config = getattr(model, '_config', None)
-
-                    import pickle
-                    from torch_einops_utils.save_load import dehydrate_config
-                    pkg = dict(
-                        model = model.state_dict(),
-                        config = pickle.dumps(dehydrate_config(config, '_config')) if config else None,
-                        step = self.step.item()
-                    )
-                    torch.save(pkg, str(ckpt_path))
-
-                    if self.use_ema:
-                        ema_ckpt_path = self.checkpoint_folder / f'tokenizer-{self.step.item()}-ema.pt'
-                        ema_model = self.ema_model.ema_model
-
-                        ema_config = getattr(ema_model, '_config', None)
-                        ema_pkg = dict(
-                            model = ema_model.state_dict(),
-                            config = pickle.dumps(dehydrate_config(ema_config, '_config')) if ema_config else None,
-                            step = self.step.item()
-                        )
-                        torch.save(ema_pkg, str(ema_ckpt_path))
-
-                    self.print(f"checkpoint saved to {state_dir} (resumable) and {ckpt_path} (legacy)")
+                try:
+                    self._save_tokenizer_checkpoint()
+                except Exception as e:
+                    self.print(f"WARNING: checkpoint save at step {self.step.item()} failed: {e}")
+                    self.print("Training will continue. The next checkpoint save will be retried.")
 
         self.accelerator.end_training()
 
@@ -774,43 +782,34 @@ class BehaviorCloneTrainer(Module):
         ema_model.load_state_dict(ema_pkg.get('model', ema_pkg), strict = False)
 
     def save_checkpoint(self):
-        # 1. Full resumable state (model + optimizer + RNG + step buffer) via
-        #    Accelerate. All ranks participate. This is what --resume_from reads.
-        state_dir = self.checkpoint_folder / f'state-{self.step.item()}'
+        """Save both a resumable accelerator state and a legacy model-only checkpoint."""
+        step = self.step.item()
+
+        # 1. Full resumable state (model + optimizer + RNG + step buffer)
+        state_dir = self.checkpoint_folder / f'state-{step}'
         self.accelerator.save_state(str(state_dir))
 
         if not self.is_main_process:
             return
 
-        # Pointer to the newest state dir so --resume_from latest works.
+        # Pointer so --resume_from latest works
         latest_pointer = self.checkpoint_folder / 'latest_state.txt'
         latest_pointer.write_text(state_dir.name)
 
-        # 2. Legacy model-only checkpoint for Phase 3 hand-off / backwards compat.
-        import pickle
-        from torch_einops_utils.save_load import dehydrate_config
-
-        ckpt_path = self.checkpoint_folder / f'dynamics-{self.step.item()}.pt'
-
+        # 2. Legacy model-only checkpoint for Phase 3 hand-off
+        ckpt_path = self.checkpoint_folder / f'dynamics-{step}.pt'
         model = self.unwrap_model(self.model)
-        config = getattr(model, '_config', None)
-
         pkg = dict(
             model = model.state_dict(),
-            config = pickle.dumps(dehydrate_config(config, '_config')) if config else None,
-            step = self.step.item()
+            step = step,
         )
         torch.save(pkg, str(ckpt_path))
 
         if self.use_ema:
-            ema_ckpt_path = self.checkpoint_folder / f'dynamics-{self.step.item()}-ema.pt'
-            ema_model = self.ema_model.ema_model
-
-            ema_config = getattr(ema_model, '_config', None)
+            ema_ckpt_path = self.checkpoint_folder / f'dynamics-{step}-ema.pt'
             ema_pkg = dict(
-                model = ema_model.state_dict(),
-                config = pickle.dumps(dehydrate_config(ema_config, '_config')) if ema_config else None,
-                step = self.step.item()
+                model = self.ema_model.ema_model.state_dict(),
+                step = step,
             )
             torch.save(ema_pkg, str(ema_ckpt_path))
 
@@ -1017,7 +1016,11 @@ class BehaviorCloneTrainer(Module):
                 self.sample(batch_data)
 
             if self.checkpoint_every > 0 and self.is_main_process and divisible_by(self.step.item(), self.checkpoint_every):
-                self.save_checkpoint()
+                try:
+                    self.save_checkpoint()
+                except Exception as e:
+                    self.print(f"WARNING: checkpoint save at step {self.step.item()} failed: {e}")
+                    self.print("Training will continue. The next checkpoint save will be retried.")
 
         self.accelerator.end_training()
         self.print('training complete')
@@ -1192,7 +1195,11 @@ class DreamTrainer(Module):
             self.step += 1
 
             if self.checkpoint_every > 0 and divisible_by(self.step.item(), self.checkpoint_every):
-                self.save_checkpoint()
+                try:
+                    self.save_checkpoint()
+                except Exception as e:
+                    self.print(f"WARNING: checkpoint save at step {self.step.item()} failed: {e}")
+                    self.print("Training will continue. The next checkpoint save will be retried.")
 
         self.accelerator.end_training()
 
