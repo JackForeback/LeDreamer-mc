@@ -1563,6 +1563,13 @@ class Attention(Module):
             v = cat((cv, v), dim = -2)
 
         # attention
+        # flex_attention requires q/k/v to share the same dtype.  Under
+        # mixed-precision autocast some projections may stay in float32
+        # (e.g. cached keys) while q/v are cast to float16/bfloat16.
+        if k.dtype != q.dtype:
+            k = k.to(q.dtype)
+        if v.dtype != q.dtype:
+            v = v.to(q.dtype)
 
         if exists(pope_pos_emb):
             out = flash_attn_with_pope(q, k, v, pos_emb = pope_pos_emb, causal = True, head_dimension_at_first = True)
