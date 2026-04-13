@@ -242,7 +242,7 @@ def train_tokenizer(args):
     dataset = MinecraftVPTDataset(
         data_dir=args.data_dir,
         seq_len=args.tokenizer_seq_len,
-        stride=args.tokenizer_seq_len // 2,
+        stride=args.tokenizer_seq_len,
         image_height=384,
         image_width=640,
         max_trajectories=args.max_trajectories,
@@ -353,7 +353,7 @@ def train_dynamics(args):
     dataset = MinecraftVPTDataset(
         data_dir=args.data_dir,
         seq_len=args.dynamics_seq_len,
-        stride=args.dynamics_seq_len // 2,
+        stride=args.dynamics_seq_len,
         image_height=384,
         image_width=640,
         max_trajectories=args.max_trajectories,

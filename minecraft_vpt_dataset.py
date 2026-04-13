@@ -647,35 +647,51 @@ class MinecraftVPTDataset(Dataset):
     def __len__(self):
         return len(self.clip_index)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx, _retries=3):
         """Decode a clip on-the-fly and return as a dict.
+
+        If frame decoding fails (corrupt MP4 data), retries with a random
+        different clip up to ``_retries`` times so a single bad file doesn't
+        crash the entire training run.
 
         Returns dict compatible with Dreamer4's BehaviorCloneTrainer:
             'video': (3, seq_len, H, W) float32 in [0, 1]
             'discrete_actions': (seq_len, 21) int64
             'rewards': (seq_len,) float32
         """
-        traj_idx, offset = self.clip_index[idx]
-        mp4_path, valid_indices, actions = self.trajectories[traj_idx]
+        for attempt in range(_retries + 1):
+            try:
+                traj_idx, offset = self.clip_index[idx]
+                mp4_path, valid_indices, actions = self.trajectories[traj_idx]
 
-        # Slice the frame indices and actions for this clip
-        clip_frame_indices = valid_indices[offset:offset + self.seq_len]
-        clip_actions = actions[offset:offset + self.seq_len]
+                # Slice the frame indices and actions for this clip
+                clip_frame_indices = valid_indices[offset:offset + self.seq_len]
+                clip_actions = actions[offset:offset + self.seq_len]
 
-        # Decode frames on-the-fly from the MP4 (no data stored in RAM)
-        frames = _decode_frames(
-            mp4_path, clip_frame_indices,
-            self.image_height, self.image_width,
-        )  # (seq_len, H, W, 3) uint8 RGB
+                # Decode frames on-the-fly from the MP4 (no data stored in RAM)
+                frames = _decode_frames(
+                    mp4_path, clip_frame_indices,
+                    self.image_height, self.image_width,
+                )  # (seq_len, H, W, 3) uint8 RGB
 
-        # (T, H, W, 3) uint8 → (3, T, H, W) float32 in [0, 1]
-        video = torch.from_numpy(frames).permute(3, 0, 1, 2).float().div_(255.0)
+                # (T, H, W, 3) uint8 → (3, T, H, W) float32 in [0, 1]
+                video = torch.from_numpy(frames).permute(3, 0, 1, 2).float().div_(255.0)
 
-        return {
-            'video': video,
-            'discrete_actions': torch.from_numpy(clip_actions.astype(np.int64)),
-            'rewards': torch.zeros(self.seq_len, dtype=torch.float32),
-        }
+                return {
+                    'video': video,
+                    'discrete_actions': torch.from_numpy(clip_actions.astype(np.int64)),
+                    'rewards': torch.zeros(self.seq_len, dtype=torch.float32),
+                }
+            except Exception as e:
+                if attempt < _retries:
+                    print(f"  Warning: decode error at clip {idx} "
+                          f"({mp4_path}), retrying with a different clip: {e}")
+                    idx = random.randint(0, len(self.clip_index) - 1)
+                else:
+                    raise RuntimeError(
+                        f"Failed to decode clip after {_retries + 1} attempts. "
+                        f"Last error: {e}"
+                    ) from e
 
 
 def collate_minecraft_batch(batch: list) -> dict:
