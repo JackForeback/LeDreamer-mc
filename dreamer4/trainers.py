@@ -190,6 +190,7 @@ class VideoTokenizerTrainer(Module):
         dataloader_num_workers: int = 0,
         dataloader_pin_memory: bool = False,
         dataloader_persistent_workers: bool | None = None,
+        dataloader_prefetch_factor: int | None = 4,
         resume_from: str | None = None,
     ):
         super().__init__()
@@ -246,6 +247,8 @@ class VideoTokenizerTrainer(Module):
         )
         if dataloader_num_workers > 0:
             dl_kwargs['persistent_workers'] = dataloader_persistent_workers
+            if dataloader_prefetch_factor is not None:
+                dl_kwargs['prefetch_factor'] = dataloader_prefetch_factor
         self.train_dataloader = DataLoader(dataset, **dl_kwargs)
 
         optim_kwargs = dict(
@@ -373,9 +376,12 @@ class VideoTokenizerTrainer(Module):
         """Save both a resumable accelerator state and a legacy model-only checkpoint."""
         step = self.step.item()
 
-        # 1. Full resumable state (model + optimizer + RNG + step buffer)
+        # 1. Full resumable state (model + optimizer + RNG + step buffer).
+        # safe_serialization=False uses torch.save (pytorch_model.bin) instead of
+        # safetensors. Required because nn.GRU.flatten_parameters() makes the GRU
+        # weight/bias tensors share storage, which safetensors refuses to save.
         state_dir = self.checkpoint_folder / f'state-{step}'
-        self.accelerator.save_state(str(state_dir))
+        self.accelerator.save_state(str(state_dir), safe_serialization = False)
 
         if self.is_main_process:
             # Pointer so --resume_from latest works
@@ -567,6 +573,7 @@ class BehaviorCloneTrainer(Module):
         dataloader_num_workers: int = 0,
         dataloader_pin_memory: bool = False,
         dataloader_persistent_workers: bool | None = None,
+        dataloader_prefetch_factor: int | None = 4,
         resume_from: str | None = None,
     ):
         super().__init__()
@@ -601,6 +608,8 @@ class BehaviorCloneTrainer(Module):
         )
         if dataloader_num_workers > 0:
             dl_kwargs['persistent_workers'] = dataloader_persistent_workers
+            if dataloader_prefetch_factor is not None:
+                dl_kwargs['prefetch_factor'] = dataloader_prefetch_factor
         self.train_dataloader = DataLoader(dataset, **dl_kwargs)
 
         self.custom_sample_fn = custom_sample_fn
@@ -785,9 +794,12 @@ class BehaviorCloneTrainer(Module):
         """Save both a resumable accelerator state and a legacy model-only checkpoint."""
         step = self.step.item()
 
-        # 1. Full resumable state (model + optimizer + RNG + step buffer)
+        # 1. Full resumable state (model + optimizer + RNG + step buffer).
+        # safe_serialization=False uses torch.save (pytorch_model.bin) instead of
+        # safetensors. Required because nn.GRU.flatten_parameters() makes the GRU
+        # weight/bias tensors share storage, which safetensors refuses to save.
         state_dir = self.checkpoint_folder / f'state-{step}'
-        self.accelerator.save_state(str(state_dir))
+        self.accelerator.save_state(str(state_dir), safe_serialization = False)
 
         if not self.is_main_process:
             return
@@ -1130,8 +1142,10 @@ class DreamTrainer(Module):
         self.accelerator.log(data, step = self.step.item())
 
     def save_checkpoint(self):
+        # safe_serialization=False: see VideoTokenizerTrainer._save_tokenizer_checkpoint
+        # for rationale (GRU flat_weights share storage, incompatible with safetensors).
         state_dir = self.checkpoint_folder / f'state-{self.step.item()}'
-        self.accelerator.save_state(str(state_dir))
+        self.accelerator.save_state(str(state_dir), safe_serialization = False)
         if self.is_main_process:
             latest_pointer = self.checkpoint_folder / 'latest_state.txt'
             latest_pointer.write_text(state_dir.name)

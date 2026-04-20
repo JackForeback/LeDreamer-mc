@@ -48,6 +48,11 @@ from pathlib import Path
 
 import torch
 
+# cuDNN autotuner picks the fastest conv/attn algorithm for the (fixed) input
+# shapes used by this script. One-line win, safe because input shapes are
+# static (384x640 video, constant seq_len per phase).
+torch.backends.cudnn.benchmark = True
+
 from dreamer4 import VideoTokenizer, DynamicsWorldModel
 from dreamer4.trainers import (
     VideoTokenizerTrainer,
@@ -289,6 +294,7 @@ def train_tokenizer(args):
         checkpoint_folder=args.output_dir,
         dataloader_num_workers=args.num_workers,
         dataloader_pin_memory=not args.no_pin_memory,
+        dataloader_prefetch_factor=args.prefetch_factor,
         resume_from=resume_from,
     )
 
@@ -395,6 +401,7 @@ def train_dynamics(args):
         checkpoint_folder=args.output_dir,
         dataloader_num_workers=args.num_workers,
         dataloader_pin_memory=not args.no_pin_memory,
+        dataloader_prefetch_factor=args.prefetch_factor,
         resume_from=resume_from,
     )
 
@@ -602,6 +609,10 @@ def main():
                              "data prep does not bottleneck GPU training.")
     parser.add_argument("--no_pin_memory", action="store_true",
                         help="Disable DataLoader pin_memory (default: enabled).")
+    parser.add_argument("--prefetch_factor", type=int, default=4,
+                        help="DataLoader prefetch_factor (per worker). Bigger "
+                             "value keeps the GPU fed while workers decode "
+                             "the next batches of video.")
     parser.add_argument("--mixed_precision", type=str, default="no",
                         choices=["no", "fp16", "bf16"],
                         help="Mixed precision mode passed to Accelerate. "
