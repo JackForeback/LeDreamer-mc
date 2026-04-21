@@ -1,5 +1,6 @@
 from __future__ import annotations
 import math
+import shutil
 from collections import OrderedDict
 from random import randint
 
@@ -77,6 +78,38 @@ def cycle(dl):
     while True:
         for batch in dl:
             yield batch
+
+# Prune older full-state dir + legacy .pt files once a newer checkpoint has
+# been written + its pointer updated. Called post-success so a crash mid-save
+# cannot leave the job with zero usable checkpoints. Keeps the newest only;
+# per-5000-step state dirs are ~1-2GB each and accumulate quickly on HPC.
+def _prune_previous_checkpoint(
+    checkpoint_folder: Path,
+    old_state_dir_name: str,
+    new_step: int,
+    legacy_prefix: str | None = None,
+):
+    if not old_state_dir_name or old_state_dir_name == f'state-{new_step}':
+        return
+    if not old_state_dir_name.startswith('state-'):
+        return
+    try:
+        old_step = int(old_state_dir_name.split('-', 1)[1])
+    except ValueError:
+        return
+
+    old_state_dir = checkpoint_folder / old_state_dir_name
+    if old_state_dir.exists():
+        shutil.rmtree(old_state_dir, ignore_errors = True)
+
+    if legacy_prefix is not None:
+        for suffix in ('.pt', '-ema.pt'):
+            old_pt = checkpoint_folder / f'{legacy_prefix}-{old_step}{suffix}'
+            if old_pt.exists():
+                try:
+                    old_pt.unlink()
+                except OSError:
+                    pass
 
 # Accelerate's register_for_checkpointing only accepts objects that expose
 # state_dict() / load_state_dict(). We keep the step counter as a tensor
@@ -376,6 +409,11 @@ class VideoTokenizerTrainer(Module):
         """Save both a resumable accelerator state and a legacy model-only checkpoint."""
         step = self.step.item()
 
+        # Read the previous pointer *before* overwriting it, so we know which
+        # state-N/ dir to prune once the new save has fully succeeded.
+        latest_pointer = self.checkpoint_folder / 'latest_state.txt'
+        prev_state_name = latest_pointer.read_text().strip() if latest_pointer.exists() else ''
+
         # 1. Full resumable state (model + optimizer + RNG + step buffer).
         # safe_serialization=False uses torch.save (pytorch_model.bin) instead of
         # safetensors. Required because nn.GRU.flatten_parameters() makes the GRU
@@ -385,7 +423,6 @@ class VideoTokenizerTrainer(Module):
 
         if self.is_main_process:
             # Pointer so --resume_from latest works
-            latest_pointer = self.checkpoint_folder / 'latest_state.txt'
             latest_pointer.write_text(state_dir.name)
 
             # 2. Legacy model-only checkpoint (for Phase 2 hand-off)
@@ -406,6 +443,11 @@ class VideoTokenizerTrainer(Module):
                 torch.save(ema_pkg, str(ema_ckpt_path))
 
             self.print(f"checkpoint saved to {state_dir} (resumable) and {ckpt_path} (legacy)")
+
+            # New save + pointer are on disk; safe to delete the previous set.
+            _prune_previous_checkpoint(
+                self.checkpoint_folder, prev_state_name, step, legacy_prefix = 'tokenizer'
+            )
 
     def forward(
         self
@@ -794,6 +836,11 @@ class BehaviorCloneTrainer(Module):
         """Save both a resumable accelerator state and a legacy model-only checkpoint."""
         step = self.step.item()
 
+        # Read the previous pointer *before* overwriting it, so we know which
+        # state-N/ dir to prune once the new save has fully succeeded.
+        latest_pointer = self.checkpoint_folder / 'latest_state.txt'
+        prev_state_name = latest_pointer.read_text().strip() if latest_pointer.exists() else ''
+
         # 1. Full resumable state (model + optimizer + RNG + step buffer).
         # safe_serialization=False uses torch.save (pytorch_model.bin) instead of
         # safetensors. Required because nn.GRU.flatten_parameters() makes the GRU
@@ -805,7 +852,6 @@ class BehaviorCloneTrainer(Module):
             return
 
         # Pointer so --resume_from latest works
-        latest_pointer = self.checkpoint_folder / 'latest_state.txt'
         latest_pointer.write_text(state_dir.name)
 
         # 2. Legacy model-only checkpoint for Phase 3 hand-off
@@ -826,6 +872,11 @@ class BehaviorCloneTrainer(Module):
             torch.save(ema_pkg, str(ema_ckpt_path))
 
         self.print(f"checkpoint saved to {state_dir} (resumable) and {ckpt_path} (legacy)")
+
+        # New save + pointer are on disk; safe to delete the previous set.
+        _prune_previous_checkpoint(
+            self.checkpoint_folder, prev_state_name, step, legacy_prefix = 'dynamics'
+        )
 
     @eval_decorator
     @torch.no_grad()
@@ -1144,12 +1195,23 @@ class DreamTrainer(Module):
     def save_checkpoint(self):
         # safe_serialization=False: see VideoTokenizerTrainer._save_tokenizer_checkpoint
         # for rationale (GRU flat_weights share storage, incompatible with safetensors).
-        state_dir = self.checkpoint_folder / f'state-{self.step.item()}'
+        step = self.step.item()
+
+        # Read the previous pointer *before* overwriting it, so we know which
+        # state-N/ dir to prune once the new save has fully succeeded.
+        latest_pointer = self.checkpoint_folder / 'latest_state.txt'
+        prev_state_name = latest_pointer.read_text().strip() if latest_pointer.exists() else ''
+
+        state_dir = self.checkpoint_folder / f'state-{step}'
         self.accelerator.save_state(str(state_dir), safe_serialization = False)
         if self.is_main_process:
-            latest_pointer = self.checkpoint_folder / 'latest_state.txt'
             latest_pointer.write_text(state_dir.name)
             self.print(f"dream checkpoint saved to {state_dir}")
+
+            # Dream phase has no legacy .pt handoff; just prune the old state dir.
+            _prune_previous_checkpoint(
+                self.checkpoint_folder, prev_state_name, step, legacy_prefix = None
+            )
 
     def forward(
         self
