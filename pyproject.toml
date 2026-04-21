@@ -52,13 +52,43 @@ Repository = "https://github.com/lucidrains/dreamer4"
 examples = []
 test = [
     "pytest",
-    "pytest-shard"
+    "pytest-shard",
+    "pytest-cov",
 ]
 
 [tool.pytest.ini_options]
 pythonpath = [
-    "."
+    ".",
+    "Video-Pre-Training",
 ]
+markers = [
+    "slow: marks tests that take >5s (deselect with -m 'not slow')",
+    "integration: cross-module integration tests",
+    "needs_minerl: requires MineRL / VPT env (Python 3.9 eval-env)",
+]
+
+[tool.coverage.run]
+branch = true
+source = [
+    "dreamer4",
+    "minecraft_vpt_dataset",
+    "train_dreamer4_minecraft",
+    "Video-Pre-Training/dreamer4_minecraft_agent.py",
+    "Video-Pre-Training/evaluate_dreamer4_minecraft.py",
+]
+omit = [
+    "tests/*",
+    "*/__pycache__/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]
+show_missing = true
+skip_covered = false
 
 [build-system]
 requires = ["hatchling"]
