@@ -4733,7 +4733,12 @@ class DynamicsWorldModel(Module):
 
             # noise from 0 as noise to 1 as data
 
-            noised_latents = noise.lerp(latents, aligned_times)
+            # torch.lerp is dtype-strict (start/end/weight must match). Under
+            # accelerate fp16 autocast, noise/latents become Half while
+            # aligned_times stays Float (get_times_from_signal_level does
+            # signal_levels.float() / max_steps). Cast the weight to keep lerp
+            # happy without losing numerical precision in time parameterization.
+            noised_latents = noise.lerp(latents, aligned_times.to(noise.dtype))
 
         # reinforcement learning related
 
@@ -4802,7 +4807,7 @@ class DynamicsWorldModel(Module):
 
                 # noise from 0 as noise to 1 as data
 
-                noised_proprio = proprio_noise.lerp(proprio, aligned_times)
+                noised_proprio = proprio_noise.lerp(proprio, aligned_times.to(noise.dtype))
 
             else:
                 noised_proprio = proprio
