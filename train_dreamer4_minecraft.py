@@ -48,22 +48,43 @@ from pathlib import Path
 
 import torch
 
-# cuDNN autotuner picks the fastest conv/attn algorithm for the (fixed) input
-# shapes used by this script. One-line win, safe because input shapes are
-# static (384x640 video, constant seq_len per phase).
-torch.backends.cudnn.benchmark = True
-
 from dreamer4 import VideoTokenizer, DynamicsWorldModel
 from dreamer4.trainers import (
     VideoTokenizerTrainer,
     BehaviorCloneTrainer,
     DreamTrainer,
+    _prune_previous_checkpoint,
 )
+
+
+def _cleanup_last_intermediate_checkpoint(output_dir, legacy_prefix):
+    """After the final phase-level .pt is saved, the most recent
+    state-<N>/ dir and <prefix>-<N>.pt files are no longer needed —
+    the per-step pruner already removed every *earlier* one, so this
+    just handles the tail. new_step=-1 guarantees the sentinel never
+    matches a real step, so the helper always deletes the target.
+    """
+    pointer = Path(output_dir) / 'latest_state.txt'
+    if not pointer.exists():
+        return
+    last_name = pointer.read_text().strip()
+    _prune_previous_checkpoint(
+        Path(output_dir), last_name, new_step=-1, legacy_prefix=legacy_prefix,
+    )
+    try:
+        pointer.unlink()
+    except OSError:
+        pass
 
 from minecraft_vpt_dataset import (
     MinecraftVPTDataset,
     DREAMER4_NUM_DISCRETE_ACTIONS,
 )
+
+# cuDNN autotuner picks the fastest conv/attn algorithm for the (fixed) input
+# shapes used by this script. One-line win, safe because input shapes are
+# static (384x640 video, constant seq_len per phase).
+torch.backends.cudnn.benchmark = True
 
 
 # ─── CUDA / resume helpers ───────────────────────────────────────────
@@ -256,10 +277,14 @@ def train_tokenizer(args):
     # The VideoTokenizerTrainer expects a dataset that yields video tensors.
     # Our dataset yields dicts, so we wrap it to extract just the video.
     class VideoOnlyDataset(torch.utils.data.Dataset):
+        """Adapter that returns only the ``'video'`` key from MinecraftVPTDataset."""
+
         def __init__(self, base_dataset):
             self.base = base_dataset
+
         def __len__(self):
             return len(self.base)
+
         def __getitem__(self, idx):
             return self.base[idx]['video']  # (3, T, H, W)
 
@@ -308,6 +333,14 @@ def train_tokenizer(args):
         'config': TOKENIZER_DEFAULTS,
     }, ckpt_path)
     print(f"Tokenizer saved to {ckpt_path}")
+
+    # Only prune the last state-<N>/ if training finished cleanly. If the
+    # trainer was cancelled via SIGTERM (scancel / walltime), keep the
+    # state dir so the user can resume with --resume_from latest.
+    if not getattr(trainer, 'cancelled', False):
+        _cleanup_last_intermediate_checkpoint(args.output_dir, legacy_prefix='tokenizer')
+    else:
+        print(f"training cancelled — keeping state dir in {args.output_dir} for --resume_from")
 
 
 # ─── Phase 2: Train Dynamics World Model ───────────────────────────
@@ -383,7 +416,8 @@ def train_dynamics(args):
         video_tokenizer=tokenizer,
         **dynamics_config,
     )
-    print(f"DynamicsWorldModel ({variant}) parameters: {sum(p.numel() for p in dynamics.parameters()):,}")
+    n_params = sum(p.numel() for p in dynamics.parameters())
+    print(f"DynamicsWorldModel ({variant}) parameters: {n_params:,}")
 
     # Train using BehaviorCloneTrainer
     # The trainer accepts dict batches and calls dynamics(**batch_data)
@@ -418,6 +452,11 @@ def train_dynamics(args):
         'use_lewm': args.use_lewm,
     }, ckpt_path)
     print(f"Dynamics model saved to {ckpt_path}")
+
+    if not getattr(trainer, 'cancelled', False):
+        _cleanup_last_intermediate_checkpoint(args.output_dir, legacy_prefix='dynamics')
+    else:
+        print(f"training cancelled — keeping state dir in {args.output_dir} for --resume_from")
 
 
 # ─── Phase 3: Dream-based Agent Training ───────────────────────────
@@ -481,7 +520,8 @@ def train_agent(args):
     for p in dynamics.value_head_parameters():
         p.requires_grad_(True)
 
-    print(f"Trainable parameters: {sum(p.numel() for p in dynamics.parameters() if p.requires_grad):,}")
+    n_trainable = sum(p.numel() for p in dynamics.parameters() if p.requires_grad)
+    print(f"Trainable parameters: {n_trainable:,}")
 
     # Train using DreamTrainer
     trainer = DreamTrainer(
@@ -514,10 +554,22 @@ def train_agent(args):
     }, ckpt_path)
     print(f"Trained agent saved to {ckpt_path}")
 
+    if not getattr(trainer, 'cancelled', False):
+        _cleanup_last_intermediate_checkpoint(args.output_dir, legacy_prefix=None)
+    else:
+        print(f"training cancelled — keeping state dir in {args.output_dir} for --resume_from")
+
 
 # ─── CLI ────────────────────────────────────────────────────────────
 
 def main():
+    """CLI entry point: parse arguments and dispatch to the requested phase.
+
+    Wires up the full argparse surface for all three phases (tokenizer /
+    dynamics / dream), validates that a data directory is present for
+    phases that need it, and then calls :func:`train_tokenizer`,
+    :func:`train_dynamics`, or :func:`train_agent` based on ``--phase``.
+    """
     parser = argparse.ArgumentParser(
         description="Train Dreamer4 on Minecraft using VPT data"
     )

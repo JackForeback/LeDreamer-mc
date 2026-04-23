@@ -1,6 +1,7 @@
 from __future__ import annotations
 import math
 import shutil
+import signal
 from collections import OrderedDict
 from random import randint
 
@@ -110,6 +111,43 @@ def _prune_previous_checkpoint(
                     old_pt.unlink()
                 except OSError:
                     pass
+
+
+# scancel (and SLURM walltime expiry) deliver SIGTERM. Python's default
+# SIGTERM handler terminates the interpreter *immediately* without running
+# `finally:` blocks, atexit hooks, or the trainer's post-loop save — so the
+# last (up to `checkpoint_every`) steps are discarded and the final `.pt`
+# dump in train_dreamer4_minecraft.train_agent() never fires. We install a
+# handler that flips a per-trainer flag; the loop checks the flag between
+# iterations and writes one last state-<N>/ before returning. A second
+# signal reverts to the default (hard-kill) handler so a hung save can
+# still be interrupted.
+def _install_stop_signal_handlers(trainer):
+    """Install SIGTERM/SIGINT handlers that request a graceful stop.
+
+    Only the main thread of the main interpreter can register signal
+    handlers. When accelerate uses launcher-managed child processes (e.g.
+    DDP), each rank's main thread installs its own handler; SLURM signals
+    every task in the job, so all ranks flip their flag ~simultaneously
+    and the save_state() collective will not deadlock.
+    """
+    def _handler(signum, frame):
+        trainer._stop_requested = True
+        # Restore default so a second Ctrl-C / second scancel hard-kills us
+        # in case the emergency save itself hangs on disk I/O.
+        try:
+            signal.signal(signum, signal.SIG_DFL)
+        except (ValueError, OSError):
+            pass
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError):
+            # Non-main thread, or embedded interpreter; accelerate's
+            # launcher may have grabbed the signal already. Not fatal —
+            # the trainer simply falls back to non-graceful cancellation.
+            pass
+
 
 # Accelerate's register_for_checkpointing only accepts objects that expose
 # state_dict() / load_state_dict(). We keep the step counter as a tensor
@@ -260,6 +298,10 @@ class VideoTokenizerTrainer(Module):
         self.checkpoint_folder = Path(checkpoint_folder)
         self.checkpoint_folder.mkdir(parents = True, exist_ok = True)
 
+        # See DreamTrainer for rationale — graceful stop on SIGTERM/SIGINT.
+        self._stop_requested = False
+        _install_stop_signal_handlers(self)
+
         self.model = model
         self.use_ema = use_ema
         self.ema_decay = ema_decay
@@ -404,6 +446,11 @@ class VideoTokenizerTrainer(Module):
 
         ema_pkg = torch.load(str(ema_path), map_location = 'cpu', weights_only = True)
         ema_model.load_state_dict(ema_pkg.get('model', ema_pkg), strict = False)
+
+    @property
+    def cancelled(self) -> bool:
+        """True iff training ended early because of SIGTERM/SIGINT."""
+        return self._stop_requested
 
     def _save_tokenizer_checkpoint(self):
         """Save both a resumable accelerator state and a legacy model-only checkpoint."""
@@ -567,9 +614,21 @@ class VideoTokenizerTrainer(Module):
                     self.print(f"WARNING: checkpoint save at step {self.step.item()} failed: {e}")
                     self.print("Training will continue. The next checkpoint save will be retried.")
 
+            # Graceful stop on SIGTERM/SIGINT (see DreamTrainer).
+            if self._stop_requested:
+                self.print(
+                    f"stop signal received at step {self.step.item()} — "
+                    f"saving emergency checkpoint before exit"
+                )
+                try:
+                    self._save_tokenizer_checkpoint()
+                except Exception as e:
+                    self.print(f"WARNING: emergency checkpoint save failed: {e}")
+                break
+
         self.accelerator.end_training()
 
-        self.print('training complete')
+        self.print('training complete' if not self._stop_requested else 'training cancelled')
 
 # dynamics world model
 
@@ -745,6 +804,11 @@ class BehaviorCloneTrainer(Module):
         self.checkpoint_folder = Path(checkpoint_folder)
         self.checkpoint_folder.mkdir(exist_ok = True, parents = True)
 
+        # See DreamTrainer for rationale — handle SIGTERM/SIGINT (scancel,
+        # walltime expiry) by flagging a graceful stop and saving before exit.
+        self._stop_requested = False
+        _install_stop_signal_handlers(self)
+
         self.ema_model = None
 
         if self.use_ema and self.accelerator.is_main_process:
@@ -831,6 +895,11 @@ class BehaviorCloneTrainer(Module):
 
         ema_pkg = torch.load(str(ema_path), map_location = 'cpu', weights_only = True)
         ema_model.load_state_dict(ema_pkg.get('model', ema_pkg), strict = False)
+
+    @property
+    def cancelled(self) -> bool:
+        """True iff training ended early because of SIGTERM/SIGINT."""
+        return self._stop_requested
 
     def save_checkpoint(self):
         """Save both a resumable accelerator state and a legacy model-only checkpoint."""
@@ -1083,10 +1152,22 @@ class BehaviorCloneTrainer(Module):
                     self.save_checkpoint()
                 except Exception as e:
                     self.print(f"WARNING: checkpoint save at step {self.step.item()} failed: {e}")
-                    self.print("Training will continue. The next checkpoint save will be retried.")
+
+            # Graceful stop on SIGTERM/SIGINT (see DreamTrainer).
+            if self._stop_requested:
+                self.print(
+                    f"stop signal received at step {self.step.item()} — "
+                    f"saving emergency checkpoint before exit"
+                )
+                try:
+                    if self.is_main_process:
+                        self.save_checkpoint()
+                except Exception as e:
+                    self.print(f"WARNING: emergency checkpoint save failed: {e}")
+                break
 
         self.accelerator.end_training()
-        self.print('training complete')
+        self.print('training complete' if not self._stop_requested else 'training cancelled')
 
 # training from dreams
 
@@ -1149,8 +1230,16 @@ class DreamTrainer(Module):
 
         self.checkpoint_every = checkpoint_every
         self.checkpoint_folder = Path(checkpoint_folder)
-        if checkpoint_every > 0:
-            self.checkpoint_folder.mkdir(parents = True, exist_ok = True)
+        # Always mkdir, even when checkpoint_every == 0. The graceful-stop
+        # path below will still try to dump a state-<N>/ on SIGTERM so the
+        # HPC job doesn't lose its last N minutes of work when scancel'd.
+        self.checkpoint_folder.mkdir(parents = True, exist_ok = True)
+
+        # Graceful cancellation: scancel/walltime-expiry deliver SIGTERM,
+        # which Python otherwise turns into an immediate exit. See the
+        # comment on _install_stop_signal_handlers for the full rationale.
+        self._stop_requested = False
+        _install_stop_signal_handlers(self)
 
         (
             self.model,
@@ -1191,6 +1280,17 @@ class DreamTrainer(Module):
 
     def log(self, **data):
         self.accelerator.log(data, step = self.step.item())
+
+    @property
+    def cancelled(self) -> bool:
+        """True iff training ended early because of SIGTERM/SIGINT.
+
+        train_dreamer4_minecraft.train_agent() inspects this to decide
+        whether to run _cleanup_last_intermediate_checkpoint (which deletes
+        state-<N>/ on clean completion). We keep the state dir around on
+        cancellation so the user can --resume_from it later.
+        """
+        return self._stop_requested
 
     def save_checkpoint(self):
         # safe_serialization=False: see VideoTokenizerTrainer._save_tokenizer_checkpoint
@@ -1277,9 +1377,23 @@ class DreamTrainer(Module):
                     self.print(f"WARNING: checkpoint save at step {self.step.item()} failed: {e}")
                     self.print("Training will continue. The next checkpoint save will be retried.")
 
+            # Graceful stop requested (SIGTERM from scancel / walltime). Dump
+            # one final state-<N>/ so resume picks up every completed step
+            # rather than only the last periodic multiple of checkpoint_every.
+            if self._stop_requested:
+                self.print(
+                    f"stop signal received at step {self.step.item()} — "
+                    f"saving emergency checkpoint before exit"
+                )
+                try:
+                    self.save_checkpoint()
+                except Exception as e:
+                    self.print(f"WARNING: emergency checkpoint save failed: {e}")
+                break
+
         self.accelerator.end_training()
 
-        self.print('training complete')
+        self.print('training complete' if not self._stop_requested else 'training cancelled')
 
 # training from sim
 

@@ -275,7 +275,7 @@ def load_trajectory(
           rewards: (T,) float32 array (zeros — VPT recordings have no reward)
     """
     # Load JSONL actions
-    with open(jsonl_path) as f:
+    with open(jsonl_path, encoding="utf-8") as f:
         json_lines = f.readlines()
         json_data = json.loads("[" + ",".join(json_lines) + "]")
 
@@ -420,7 +420,7 @@ def prescan_trajectory(
         actions: (N, 21) int16 array of Dreamer4 discrete actions.
     """
     # Read JSONL
-    with open(jsonl_path) as f:
+    with open(jsonl_path, encoding="utf-8") as f:
         json_data = [json.loads(line) for line in f]
 
     # Get frame count from video header only (no pixel decode)
@@ -497,7 +497,7 @@ def _zero_pad_frame(frame, image_height, image_width):
             frame, pad_top, pad_bottom, 0, 0,
             cv2.BORDER_CONSTANT, value=(0, 0, 0)
         )
-    elif h != image_height or w != image_width:
+    if h != image_height or w != image_width:
         return cv2.resize(frame, (image_width, image_height),
                           interpolation=cv2.INTER_LINEAR)
     return frame
@@ -645,6 +645,7 @@ class MinecraftVPTDataset(Dataset):
               f" (backend: {'decord' if HAS_DECORD else 'cv2'})")
 
     def __len__(self):
+        """Return the number of sliding-window clips across all trajectories."""
         return len(self.clip_index)
 
     def __getitem__(self, idx, _retries=3):

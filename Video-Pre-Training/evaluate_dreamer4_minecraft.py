@@ -41,10 +41,10 @@ import numpy as np
 
 # Add paths for imports — this script lives inside Video-Pre-Training/,
 # so go up one level to find the dreamer4 package and minecraft_vpt_dataset.
-_this_dir = os.path.dirname(os.path.abspath(__file__))       # .../Video-Pre-Training
-_project_root = os.path.dirname(_this_dir)                    # .../dreamer4 (repo root)
-sys.path.insert(0, _this_dir)                                 # VPT local imports (agent.py, lib/)
-sys.path.insert(0, _project_root)                             # dreamer4 package + minecraft_vpt_dataset
+_this_dir = os.path.dirname(os.path.abspath(__file__))  # .../Video-Pre-Training
+_project_root = os.path.dirname(_this_dir)              # .../dreamer4 (repo root)
+sys.path.insert(0, _this_dir)      # VPT local imports (agent.py, lib/)
+sys.path.insert(0, _project_root)  # dreamer4 package + minecraft_vpt_dataset
 
 
 # Diamond tech tree tasks in progression order.
@@ -77,7 +77,17 @@ class EpisodeResult:
 
 
 def check_inventory(info: dict, item_name: str) -> bool:
-    """Check if an item is present in the player's inventory."""
+    """Check if ``item_name`` is present in the player's MineRL inventory.
+
+    Args:
+        info: MineRL ``info`` dict returned by ``env.step``.
+        item_name: Minecraft item id (e.g. ``"log"``, ``"iron_pickaxe"``).
+
+    Returns:
+        True if the inventory entry for ``item_name`` exists with a
+        count greater than zero, False otherwise (including when the
+        inventory field is missing or not a dict).
+    """
     inventory = info.get("inventory", {})
     if isinstance(inventory, dict):
         return inventory.get(item_name, 0) > 0
@@ -125,11 +135,14 @@ def run_worker(
 
         # Reduce JVM heap from 4G to 2G per instance to prevent OOM kills
         _orig_mc_init = MinecraftInstance.__init__
-        def _mc_init_with_reduced_mem(self, port=None, existing=False, status_dir=None,
-                                    seed=None, instance_id=None, max_mem=args_dict["minecraft_mem"]):
-            _orig_mc_init(self, port, existing, status_dir, seed, instance_id, max_mem)
-        MinecraftInstance.__init__ = _mc_init_with_reduced_mem
+        _mc_max_mem = args_dict["minecraft_mem"]
 
+        def _mc_init_with_reduced_mem(self, port=None, existing=False,
+                                      status_dir=None, seed=None,
+                                      instance_id=None, max_mem=_mc_max_mem):
+            _orig_mc_init(self, port, existing, status_dir, seed,
+                          instance_id, max_mem)
+        MinecraftInstance.__init__ = _mc_init_with_reduced_mem
 
         env = HumanSurvival(**ENV_KWARGS).make()
 
@@ -157,7 +170,7 @@ def run_worker(
                     print(f"[Worker {worker_id}] env.reset() attempt {attempt+1}/5 failed: {e}")
                     if attempt < 4:
                         try:
-                            env.close() # have to make new or will just keep getting error
+                            env.close()  # have to make new or will just keep getting error
                         except Exception:
                             pass
                         time.sleep(10 * (attempt + 1))
@@ -181,7 +194,8 @@ def run_worker(
 
                 # Detect MineRL returning a random obs due to a dead Minecraft process
                 if 'error' in info:
-                    print(f"[Worker {worker_id}] Minecraft connection lost at step {step}, ending episode")
+                    print(f"[Worker {worker_id}] Minecraft connection lost at "
+                          f"step {step}, ending episode")
                     break
 
                 total_reward += reward
@@ -263,13 +277,24 @@ def aggregate_results(results: List[EpisodeResult]) -> Dict:
 
 
 def main():
+    """CLI entry point: spawn worker processes and collect evaluation results.
+
+    Builds a shared ``episode_queue`` of ``n_episodes`` work items (plus
+    one ``None`` poison pill per worker), forks ``n_workers`` worker
+    processes running :func:`run_worker`, drains the ``result_queue``
+    with a one-hour-per-result timeout, aggregates stats via
+    :func:`aggregate_results`, prints a tech-tree progression table,
+    and writes the full JSON report to ``--output_json``.
+    """
     parser = argparse.ArgumentParser("Dreamer4 Minecraft Evaluation")
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to dreamer4_minecraft.pt")
     parser.add_argument("--n_episodes", type=int, default=100)
     parser.add_argument("--n_workers", type=int, default=1)
     parser.add_argument("--minecraft_mem", type=str, default="4G",
-                        help="Max JVM heap per Minecraft instance (e.g., '2G', '1G'). Enables parallelism with low VRAM.")
+                        help="Max JVM heap per Minecraft instance "
+                             "(e.g., '2G', '1G'). Enables parallelism "
+                             "with low VRAM.")
     parser.add_argument("--max_steps", type=int, default=36000,
                         help="Max steps per episode (36000 = 30min at 20fps)")
     parser.add_argument("--deterministic", action="store_true")
@@ -340,7 +365,8 @@ def main():
             t = stats["tasks"][task_name]
             sr = f"{t['success_rate']*100:.1f}%"
             ns = str(t["n_successes"])
-            ms = f"{t['mean_steps_to_success']:.0f}" if t["mean_steps_to_success"] != float("inf") else "N/A"
+            mean_steps = t["mean_steps_to_success"]
+            ms = f"{mean_steps:.0f}" if mean_steps != float("inf") else "N/A"
             print(f"{task_name:<20} {sr:>12} {ns:>10} {ms:>12}")
 
         output = {
@@ -348,7 +374,7 @@ def main():
             "episodes": [asdict(r) for r in results],
             "config": vars(args),
         }
-        with open(args.output_json, "w") as f:
+        with open(args.output_json, "w", encoding="utf-8") as f:
             json.dump(output, f, indent=2, default=str)
         print(f"\nResults saved to {args.output_json}")
     else:

@@ -39,25 +39,30 @@ import torch
 import cv2
 
 # Add paths for imports
-_this_dir = os.path.dirname(os.path.abspath(__file__))       # .../Video-Pre-Training
-_project_root = os.path.dirname(_this_dir)                    # .../dreamer4 (repo root)
-sys.path.insert(0, _this_dir)                                 # VPT local imports (agent.py, lib/)
-sys.path.insert(0, _project_root)                             # dreamer4 package + minecraft_vpt_dataset
+_this_dir = os.path.dirname(os.path.abspath(__file__))  # .../Video-Pre-Training
+_project_root = os.path.dirname(_this_dir)              # .../dreamer4 (repo root)
+sys.path.insert(0, _this_dir)      # VPT local imports (agent.py, lib/)
+sys.path.insert(0, _project_root)  # dreamer4 package + minecraft_vpt_dataset
 
-from dreamer4 import VideoTokenizer, DynamicsWorldModel
+# pylint: disable=wrong-import-position
+# These imports must follow the sys.path edits above because agent.py and
+# lib.actions live inside Video-Pre-Training/, and dreamer4 / minecraft_vpt_dataset
+# live at the repo root — neither is on sys.path when this module is imported
+# directly (not as part of a package).
+from dreamer4 import VideoTokenizer, DynamicsWorldModel  # noqa: E402
 
-from agent import ENV_KWARGS, validate_env, resize_image
-from lib.actions import ActionTransformer, Buttons
+from agent import ENV_KWARGS, validate_env, resize_image  # noqa: E402
+from lib.actions import ActionTransformer  # noqa: E402
 
-from minecraft_vpt_dataset import (
+from minecraft_vpt_dataset import (  # noqa: E402
     BUTTONS_ALL,
     N_BUTTONS,
     N_CAMERA_BINS,
     CAMERA_MAXVAL,
     CAMERA_BINSIZE,
     CAMERA_MU,
-    DREAMER4_NUM_DISCRETE_ACTIONS,
 )
+# pylint: enable=wrong-import-position
 
 
 # VPT action transformer for converting discrete bins back to env actions
@@ -179,7 +184,8 @@ class Dreamer4MinecraftAgent:
 
         self.dynamics.to(self.device)
 
-        print(f"Loaded Dreamer4 agent ({sum(p.numel() for p in self.dynamics.parameters()):,} params)")
+        n_params = sum(p.numel() for p in self.dynamics.parameters())
+        print(f"Loaded Dreamer4 agent ({n_params:,} params)")
 
         # Internal state
         self._latent_history = []     # List of (1, 1, num_views, num_latents, dim_latent) tensors
@@ -187,9 +193,8 @@ class Dreamer4MinecraftAgent:
         self._reward_history = []     # List of (1, 1) reward tensors
         self._step_count = 0
 
-    def load_weights(self, path: str):
+    def load_weights(self, path: str):  # noqa: ARG002  (interface compat)
         """Compatibility stub — weights are loaded in __init__."""
-        pass
 
     def reset(self):
         """Reset agent state for a new episode."""
@@ -293,7 +298,8 @@ class Dreamer4MinecraftAgent:
             step_sizes=step_size,
             rewards=rewards,
             discrete_actions=discrete_actions,
-            latent_is_noised=True,           # Skip noise injection — latents are clean from tokenizer
+            # Skip noise injection — latents are clean from tokenizer
+            latent_is_noised=True,
             return_pred_only=True,
             return_intermediates=True,
         )
