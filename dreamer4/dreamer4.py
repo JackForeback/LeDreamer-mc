@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 import numpy as np
 from math import ceil, log2
@@ -123,18 +123,18 @@ class Experience:
     proprio: MaybeTensor = None
     critic_state: MaybeTensor = None
     agent_embed: MaybeTensor = None
-    rewards: Tensor | None = None
-    terminals: Tensor | None = None
-    actions: Actions | None = None
-    log_probs: Actions | None = None
-    old_action_unembeds: tuple[MaybeTensor, MaybeTensor] | None = None
+    rewards: Optional[Tensor] = None
+    terminals: Optional[Tensor] = None
+    actions: Optional[Actions] = None
+    log_probs: Optional[Actions] = None
+    old_action_unembeds: Optional[tuple[MaybeTensor, MaybeTensor]] = None
     values: MaybeTensor = None
-    step_size: int | None = None
+    step_size: Optional[int] = None
     lens: MaybeTensor = None
     is_truncated: MaybeTensor = None
     agent_index: int = 0
-    is_from_world_model: bool | Tensor = True
-    episode_return: Tensor | None = None
+    is_from_world_model: Union[bool, Tensor] = True
+    episode_return: Optional[Tensor] = None
 
     def cpu(self):
         return self.to(torch.device('cpu'))
@@ -437,7 +437,7 @@ class LossNormalizer(Module):
 
     def forward(
         self,
-        losses: Tensor | list[Tensor] | dict[str, Tensor],
+        losses: Union[Tensor, list[Tensor], dict[str, Tensor]],
         update_ema = None
     ):
         exp_avg_sq, beta = self.exp_avg_sq, self.beta
@@ -465,7 +465,7 @@ class LossNormalizer(Module):
 class LPIPSLoss(Module):
     def __init__(
         self,
-        vgg: Module | None = None,
+        vgg: Optional[Module] = None,
         vgg_weights: VGG16_Weights = VGG16_Weights.DEFAULT,
         sampled_frames = 1
     ):
@@ -517,8 +517,8 @@ class LatentAutoregressiveLoss(Module):
         dim,
         dim_in = None,
         use_rmsnorm = False,
-        sigreg_loss_kwargs: dict | None = None,
-        net: Module | None = None
+        sigreg_loss_kwargs: Optional[dict] = None,
+        net: Optional[Module] = None
     ):
         super().__init__()
         dim_in = default(dim_in, dim)
@@ -732,9 +732,9 @@ class ActionEmbedder(Module):
         self,
         dim,
         *,
-        num_discrete_actions: int | tuple[int, ...] = 0,
+        num_discrete_actions: Union[int, tuple[int, ...]] = 0,
         num_continuous_actions  = 0,
-        continuous_norm_stats: tuple[tuple[float, float], ...] | None = None,
+        continuous_norm_stats: Optional[tuple[tuple[float, float], ...]] = None,
         can_unembed = False,
         unembed_dim = None,
         num_unembed_preds = 1,
@@ -853,7 +853,7 @@ class ActionEmbedder(Module):
         discrete_action_types = None,    # (na)
         continuous_action_types = None,  # (na)
         return_split_discrete = False,
-        pred_head_index: int | Tensor | None = None
+        pred_head_index: Optional[Union[int, Tensor]] = None
 
     ):  # (... discrete_na), (... continuous_na 2)
 
@@ -930,7 +930,7 @@ class ActionEmbedder(Module):
         discrete_temperature = 1.,
         continuous_temperature = 1.,
         inverse_norm_continuous = None,
-        pred_head_index: int | Tensor | None = None,
+        pred_head_index: Optional[Union[int, Tensor]] = None,
         parallel_discrete_calc = True,
         squeeze = True,
         **kwargs
@@ -966,7 +966,7 @@ class ActionEmbedder(Module):
         continuous_targets = None,       # (... na)
         discrete_action_types = None,    # (na)
         continuous_action_types = None,  # (na)
-        pred_head_index: int | Tensor | None = None,
+        pred_head_index: Optional[Union[int, Tensor]] = None,
         parallel_discrete_calc = None,
         return_entropies = False
     ):
@@ -1504,7 +1504,7 @@ class Attention(Module):
         rotary_pos_emb = None,
         pope_pos_emb = None,
         residual_values = None,  # (b n h d)
-        attend_fn: Callable | None = None
+        attend_fn: Optional[Callable] = None
     ):
         tokens, inverse_packed_batch = pack_one(tokens, '* n d')
 
@@ -1688,7 +1688,7 @@ class AttentionPool(Module):
     def forward(
         self,
         x,
-        hiddens: list[Tensor] | None = None,
+        hiddens: Optional[list[Tensor]] = None,
         **kwargs
     ):
         assert exists(hiddens), 'hiddens must be passed to AttentionPool'
@@ -1818,7 +1818,7 @@ class AxialSpaceTimeTransformer(Module):
     def forward(
         self,
         tokens, # (b t s d)
-        cache: TransformerIntermediates | None = None,
+        cache: Optional[TransformerIntermediates] = None,
         return_intermediates = False
     ): # (b t s d) | (y 2 b h t d)
 
@@ -2088,7 +2088,7 @@ class VideoTokenizer(Module):
         decoder_pos_mlp_depth = 2,
         channels = 3,
         per_image_patch_mask_prob = (0., 0.9), # probability of patch masking appears to be per image probabilities drawn uniformly between 0. and 0.9 - if you are a phd student and think i'm mistakened, please open an issue
-        lpips_loss_network: Module | None = None,
+        lpips_loss_network: Optional[Module] = None,
         lpips_loss_weight = 0.2,
         encoder_add_decorr_aux_loss = False,
         time_decorr_loss_weight = 4e-3,
@@ -2100,7 +2100,7 @@ class VideoTokenizer(Module):
         causal_conv3d_kernel_size = 3,
         decoder_flow_steps = 1,
         decoder_v_space_loss = True,
-        latent_receive_grad_frac: Callable | None = None,
+        latent_receive_grad_frac: Optional[Callable] = None,
         latent_grad_only_at_noise = False,
         latent_ar_loss_weight = 0.,
         latent_ar_sigreg_loss_weight = 0.05,
@@ -2643,7 +2643,7 @@ class SelfFlow(Module):
         model,
         student_layer = -3,
         teacher_layer = -1,
-        teacher_time_modifier_fn: Callable | None = None
+        teacher_time_modifier_fn: Optional[Callable] = None
     ):
         super().__init__()
         depth = model.depth
@@ -2695,7 +2695,7 @@ class DynamicsWorldModel(Module):
         self,
         dim,
         dim_latent,
-        video_tokenizer: VideoTokenizer | None = None,
+        video_tokenizer: Optional[VideoTokenizer] = None,
         max_steps = 64,                # K_max in paper
         num_register_tokens = 8,       # they claim register tokens led to better temporal consistency
         num_spatial_tokens = 2,        # latents projected to greater number of spatial tokens
@@ -2706,7 +2706,7 @@ class DynamicsWorldModel(Module):
         dim_proprio = None,
         dim_state = None,
         dim_critic_state = None,
-        critic_state_embedder: Module | None = None,
+        critic_state_embedder: Optional[Module] = None,
         reward_encoder_kwargs: dict = dict(),
         depth = 4,
         pred_orig_latent = True,   # directly predicting the original x0 data yield better results, rather than velocity (x-space vs v-space)
@@ -2728,7 +2728,7 @@ class DynamicsWorldModel(Module):
         agent_predicts_state = False,
         agent_state_pred_loss_weight = 0.1,
         eps_latent_pred = 1e-6,
-        num_discrete_actions: int | tuple[int, ...] = 0,
+        num_discrete_actions: Union[int, tuple[int, ...]] = 0,
         num_continuous_actions = 0,
         continuous_norm_stats = None,
         multi_token_pred_len = 8,                   # they do multi-token prediction of 8 steps forward
@@ -2736,12 +2736,12 @@ class DynamicsWorldModel(Module):
         policy_head_mlp_depth = 3,
         latent_flow_loss_weight = 1.,
         shortcut_loss_weight = 1.,
-        reward_loss_weight: float | list[float] = 1.,
+        reward_loss_weight: Union[float, list[float]] = 1.,
         predict_terminals: bool = True,
         predict_terminal_mlp_kwargs: dict = dict(depth = 1),
         terminal_loss_weight: float = 1.,
-        discrete_action_loss_weight: float | list[float] = 1.,
-        continuous_action_loss_weight: float | list[float] = 1.,
+        discrete_action_loss_weight: Union[float, list[float]] = 1.,
+        continuous_action_loss_weight: Union[float, list[float]] = 1.,
         num_latent_genes = 0,                       # for carrying out evolution within the dreams https://web3.arxiv.org/abs/2503.19037
         keep_reward_ema_stats = False,
         reward_ema_decay = 0.998,
@@ -2763,7 +2763,7 @@ class DynamicsWorldModel(Module):
         gae_use_accelerated = False,
         use_loss_normalization = False,
         time_attention_use_pope = False,
-        latent_ar_layer: int | tuple[int, int] | None = None,
+        latent_ar_layer: Optional[Union[int, tuple[int, int]]] = None,
         latent_ar = False,
         latent_ar_action_conditioned = False,
         latent_ar_loss_weight = 0.,
@@ -2772,7 +2772,7 @@ class DynamicsWorldModel(Module):
         use_lewm_dynamics = False,
         lewm_loss_weight = 1.,
         lewm_sigreg_loss_weight = 0.05,
-        lewm_layer: int | tuple[int, int] = -1,
+        lewm_layer: Union[int, tuple[int, int]] = -1,
         lewm_action_conditioned = False,
         lewm_sigreg_loss_kwargs: dict = dict(num_slices = 256)
     ):
@@ -3598,8 +3598,8 @@ class DynamicsWorldModel(Module):
     def learn_from_experience(
         self,
         experience: Experience,
-        policy_optim: Optimizer | None = None,
-        value_optim: Optimizer | None = None,
+        policy_optim: Optional[Optimizer] = None,
+        value_optim: Optional[Optimizer] = None,
         only_learn_policy_value_heads = True, # in the paper, they do not finetune the entire dynamics model, they just learn the heads
         use_pmpo = True,
         use_delight_gating = None,
@@ -3965,13 +3965,13 @@ class DynamicsWorldModel(Module):
         num_steps = 4,
         batch_size = 1,
         agent_index = 0,
-        tasks: int | Tensor | None = None,
+        tasks: Optional[Union[int, Tensor]] = None,
         latent_gene_ids = None,
         image_height = None,
         image_width = None,
         return_decoded_video = None,
         context_signal_noise = 0.1,       # they do a noising of the past, this was from an old diffusion world modeling paper from EPFL iirc
-        time_cache: Tensor | None = None,
+        time_cache: Optional[Tensor] = None,
         use_time_cache = True,
         return_rewards_per_frame = False,
         return_terminals = False,
@@ -3981,12 +3981,12 @@ class DynamicsWorldModel(Module):
         return_time_cache = False,
         store_agent_embed = True,
         store_old_action_unembeds = True,
-        prompt: Tensor | None = None, # (b c t h w) or (b c h w)
-        prompt_latents: Tensor | None = None, # (b t v n d)
-        prompt_proprio: Tensor | None = None,
-        prompt_discrete_actions: Tensor | None = None,
-        prompt_continuous_actions: Tensor | None = None,
-        prompt_rewards: Tensor | None = None,
+        prompt: Optional[Tensor] = None, # (b c t h w) or (b c h w)
+        prompt_latents: Optional[Tensor] = None, # (b t v n d)
+        prompt_proprio: Optional[Tensor] = None,
+        prompt_discrete_actions: Optional[Tensor] = None,
+        prompt_continuous_actions: Optional[Tensor] = None,
+        prompt_rewards: Optional[Tensor] = None,
         discrete_temperature = 1.,
         continuous_temperature = 1.,
     ): # (b t n d) | (b c t h w)
@@ -4593,7 +4593,7 @@ class DynamicsWorldModel(Module):
         latent_has_view_dim = False,
         seed = None,
         agent_token_cond = None,         # (b t d) optional conditioning to be summed to agent tokens
-        time_modifier_fn: Callable | None = None
+        time_modifier_fn: Optional[Callable] = None
     ):
         # handle video or latents
 

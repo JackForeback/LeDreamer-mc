@@ -31,13 +31,53 @@ import os
 import sys
 import json
 import time
+import atexit
+import signal
 import argparse
 import subprocess
+import traceback
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List
 from multiprocessing import Queue, get_context
 
 import numpy as np
+
+
+# Sentinel result payload signalling a worker exited before producing results.
+# Carries the worker id and the raw traceback so the parent can surface it
+# instead of silently hanging on result_queue.get() forever.
+@dataclass
+class WorkerFailure:
+    worker_id: int
+    stage: str           # "startup", "reset", "step", etc.
+    error: str           # repr(exception)
+    tb: str              # traceback.format_exc()
+
+
+# Parent-side registry of live child processes so SIGTERM/SIGINT in the
+# driver reaps them. Populated in main(), consumed in _terminate_children.
+_CHILDREN = []
+
+
+def _terminate_children(*_args):
+    """Kill any still-running worker processes. Safe to call multiple times."""
+    for p in _CHILDREN:
+        try:
+            if p.is_alive():
+                p.terminate()
+        except Exception:
+            pass
+    # Give them a moment to die, then hard-kill anything left.
+    deadline = time.time() + 5
+    for p in _CHILDREN:
+        try:
+            remaining = max(0.0, deadline - time.time())
+            p.join(timeout=remaining)
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=2)
+        except Exception:
+            pass
 
 # Add paths for imports — this script lives inside Video-Pre-Training/,
 # so go up one level to find the dreamer4 package and minecraft_vpt_dataset.
@@ -113,6 +153,26 @@ def run_worker(
     os.environ["DISPLAY"] = f":{display_num}"
 
     xvfb_proc = None
+    env = None
+
+    def _emit_failure(stage, exc):
+        """Send traceback back to parent so it lands in sbatch stdout."""
+        try:
+            result_queue.put(WorkerFailure(
+                worker_id=worker_id,
+                stage=stage,
+                error=repr(exc),
+                tb=traceback.format_exc(),
+            ))
+        except Exception:
+            pass
+
+    # Ensure SIGTERM from the parent kills the Minecraft JVMs before we exit.
+    # Without this, an aborted run leaves a tree of Java processes on HPC.
+    def _worker_signal_handler(signum, _frame):
+        raise SystemExit(f"worker {worker_id} received signal {signum}")
+    signal.signal(signal.SIGTERM, _worker_signal_handler)
+
     if args_dict.get("headless", True):
         try:
             xvfb_proc = subprocess.Popen(
@@ -126,10 +186,19 @@ def run_worker(
             xvfb_proc = None
 
     try:
-        from minerl.herobraine.env_specs.human_survival_specs import HumanSurvival
-        from agent import ENV_KWARGS
-        from dreamer4_minecraft_agent import Dreamer4MinecraftAgent
-        from minerl.env.malmo import InstanceManager, MinecraftInstance
+        try:
+            from minerl.herobraine.env_specs.human_survival_specs import HumanSurvival
+            from agent import ENV_KWARGS
+            from dreamer4_minecraft_agent import Dreamer4MinecraftAgent
+            from minerl.env.malmo import InstanceManager, MinecraftInstance
+        except Exception as e:
+            # Import-time failure (e.g. the Python 3.9 / PEP 604 issue this file
+            # has tripped on before). Surface it through the result queue so the
+            # parent can abort instead of waiting an hour per missing result.
+            print(f"[Worker {worker_id}] Import error: {e}")
+            traceback.print_exc()
+            _emit_failure("import", e)
+            return
 
         InstanceManager.configure_malmo_base_port(9000 + worker_id * 100)
 
@@ -144,13 +213,25 @@ def run_worker(
                           instance_id, max_mem)
         MinecraftInstance.__init__ = _mc_init_with_reduced_mem
 
-        env = HumanSurvival(**ENV_KWARGS).make()
+        try:
+            env = HumanSurvival(**ENV_KWARGS).make()
+        except Exception as e:
+            print(f"[Worker {worker_id}] env construction failed: {e}")
+            traceback.print_exc()
+            _emit_failure("env_make", e)
+            return
 
-        agent = Dreamer4MinecraftAgent(
-            env,
-            checkpoint_path=args_dict["checkpoint"],
-            stochastic=not args_dict.get("deterministic", False),
-        )
+        try:
+            agent = Dreamer4MinecraftAgent(
+                env,
+                checkpoint_path=args_dict["checkpoint"],
+                stochastic=not args_dict.get("deterministic", False),
+            )
+        except Exception as e:
+            print(f"[Worker {worker_id}] agent construction failed: {e}")
+            traceback.print_exc()
+            _emit_failure("agent_init", e)
+            return
 
         while True:
             episode_id = episode_queue.get()
@@ -231,16 +312,28 @@ def run_worker(
                 f"time={wall_time:.1f}s"
             )
 
-        env.close()
-
     except Exception as e:
         print(f"[Worker {worker_id}] Fatal error: {e}")
-        import traceback
         traceback.print_exc()
+        _emit_failure("fatal", e)
     finally:
+        # Close the MineRL env first — this shuts down the Minecraft JVM.
+        # Without it, the Java child of this worker survives and lingers
+        # as a zombie until the Slurm job hits its wall time.
+        if env is not None:
+            try:
+                env.close()
+            except Exception:
+                pass
         if xvfb_proc is not None:
-            xvfb_proc.terminate()
-            xvfb_proc.wait()
+            try:
+                xvfb_proc.terminate()
+                xvfb_proc.wait(timeout=5)
+            except Exception:
+                try:
+                    xvfb_proc.kill()
+                except Exception:
+                    pass
 
 
 def aggregate_results(results: List[EpisodeResult]) -> Dict:
@@ -325,29 +418,82 @@ def main():
         "headless": not args.no_headless,
     }
 
+    # Install the global cleanup hooks BEFORE any child starts. atexit covers
+    # normal exits, the signal handlers cover sbatch SIGTERM / user Ctrl-C.
+    # Whatever happens below, worker processes (and therefore their Xvfb and
+    # Minecraft JVM children) get reaped rather than becoming zombies.
+    atexit.register(_terminate_children)
+    signal.signal(signal.SIGTERM, _terminate_children)
+    signal.signal(signal.SIGINT, _terminate_children)
+
     workers = []
     for w in range(args.n_workers):
         p = ctx.Process(target=run_worker, args=(w, episode_queue, result_queue, args_dict))
         p.start()
         workers.append(p)
+        _CHILDREN.append(p)
         if w < args.n_workers - 1:
             time.sleep(10)  # Stagger Minecraft JVM launches to avoid resource contention
 
     print(f"Started {args.n_workers} workers for {args.n_episodes} episodes")
 
     results = []
+    failures = []
     for _ in range(args.n_episodes):
-        try:
-            result = result_queue.get(timeout=3600)  # 1 hour timeout per episode
-            results.append(result)
-            if len(results) % 10 == 0:
-                print(f"Progress: {len(results)}/{args.n_episodes} episodes")
-        except Exception:
-            print(f"Timeout waiting for results, got {len(results)}/{args.n_episodes}")
+        # Poll result_queue with a short timeout so we can notice that every
+        # worker has died (e.g. import error) instead of hanging for an hour.
+        while True:
+            try:
+                item = result_queue.get(timeout=30)
+            except Exception:
+                # Nothing came through in 30s — are any workers still running?
+                if not any(p.is_alive() for p in workers):
+                    print(
+                        f"[main] All {len(workers)} workers have exited; "
+                        f"aborting with {len(results)}/{args.n_episodes} results "
+                        f"({len(failures)} worker failure(s) reported)."
+                    )
+                    break
+                continue  # workers still alive, keep waiting
             break
 
+        if isinstance(item, WorkerFailure):
+            failures.append(item)
+            print(
+                f"[main] Worker {item.worker_id} failed during "
+                f"'{item.stage}': {item.error}"
+            )
+            print(item.tb)
+            # If every worker has died, no point draining further — abort now.
+            if not any(p.is_alive() for p in workers):
+                print(
+                    f"[main] No workers remain; aborting after "
+                    f"{len(failures)} failure(s)."
+                )
+                break
+            continue
+        if item is None:
+            # treat as timeout-with-dead-workers: already handled above
+            break
+
+        results.append(item)
+        if len(results) % 10 == 0:
+            print(f"Progress: {len(results)}/{args.n_episodes} episodes")
+
+    # Best-effort graceful shutdown; _terminate_children (via atexit) will
+    # force-kill anything still alive.
     for p in workers:
         p.join(timeout=30)
+    _terminate_children()
+
+    if failures and not results:
+        print("\n" + "=" * 60)
+        print("EVALUATION ABORTED — all workers failed before producing results")
+        print("=" * 60)
+        for f in failures[:3]:  # show first few tracebacks
+            print(f"\n[Worker {f.worker_id}] stage={f.stage} error={f.error}")
+            print(f.tb)
+        sys.exit(2)
 
     if results:
         stats = aggregate_results(results)
