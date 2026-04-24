@@ -1,6 +1,6 @@
 #!/bin/bash
-# Setup script for the eval-venv venv (Python 3.9) with all dreamer4 + minerl deps.
-# Assumes eval-venv/ already exists with Python 3.9 and core packages installed
+# Setup script for the eval-env venv (Python 3.9) with all dreamer4 + minerl deps.
+# Assumes eval-env/ already exists with Python 3.9 and core packages installed
 # (torch, minerl, numpy, etc.). This script (a) uninstalls the typing backport,
 # (b) installs/pins the packages that must bypass the resolver, and (c) patches
 # two site-packages files whose Python 3.10+ syntax breaks on Python 3.9.
@@ -11,9 +11,11 @@
 #
 # Run from the repo root:
 #   bash scripts/setup-eval-venv.sh
+#
+#   FIXME Currently ignores minerl and custom deps needed for dreamer4 (train env cmd).
 set -e
 
-VENV_DIR="./eval-venv"
+VENV_DIR="./eval-env"
 PIP="${VENV_DIR}/bin/pip"
 PYTHON="${VENV_DIR}/bin/python"
 

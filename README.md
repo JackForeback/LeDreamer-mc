@@ -2,6 +2,8 @@
 
 # LeDreamer-mc
 
+[Documentation](https://jackforeback.github.io/LeDreamer-mc/)
+
 **Dream-based reinforcement learning for Minecraft, combining Dreamer4 with LeWM (JEPA-style) world model dynamics.**
 
 LeDreamer-mc trains agents to play Minecraft entirely from imagination. It learns a world model from [OpenAI VPT](https://github.com/openai/Video-Pre-Training) demonstration recordings, then trains a policy inside the model's "dreams" without any real environment interaction. The project provides two dynamics model variants:
