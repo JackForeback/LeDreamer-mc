@@ -1,0 +1,58 @@
+name: Deploy pdoc Documentation
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: pip
+
+      - name: Install dependencies
+        # CPU-only torch keeps the runner under disk/time limits; pdoc only
+        # introspects signatures and docstrings, so no GPU runtime is needed.
+        # `pip install -e .` pulls in einops / accelerate / etc. from
+        # pyproject.toml so the modules can be imported. minerl / gym are
+        # stubbed with MagicMock inside _render_pdoc.py.
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+          pip install -e .
+          pip install pdoc
+
+      - name: Render documentation
+        run: python release2_artifacts/_render_pdoc.py
+
+      - name: Setup GitHub Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: './release2_artifacts/docs'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
