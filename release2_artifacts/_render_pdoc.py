@@ -24,7 +24,8 @@ for name in [
     "minerl", "minerl.herobraine", "minerl.herobraine.env_specs",
     "minerl.herobraine.env_specs.human_survival_specs",
     "minerl.herobraine.hero", "minerl.herobraine.hero.mc",
-    "minerl.env", "minerl.env.malmo",
+    "minerl.env", "minerl.env.malmo", "hyper_connections",
+    "attr",
 ]:
     sys.modules[name] = MagicMock(name=name)
 
