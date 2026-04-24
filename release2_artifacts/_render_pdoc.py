@@ -20,7 +20,7 @@ REPO = Path(__file__).resolve().parent.parent
 # Stubs for the minerl / gym stack — attribute access on a MagicMock
 # auto-returns more MagicMocks, so even nested imports resolve.
 for name in [
-    "gym3", "gym3.types", "gym", "gym.spaces",
+    "gym3", "gym3.types", "gym", "gym.spaces", "cv2", "decord",
     "minerl", "minerl.herobraine", "minerl.herobraine.env_specs",
     "minerl.herobraine.env_specs.human_survival_specs",
     "minerl.herobraine.hero", "minerl.herobraine.hero.mc",
